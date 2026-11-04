@@ -70,9 +70,13 @@ def merge_rows(rows: Iterable[dict], *, merge_seconds: int) -> list[dict]:
                 and int(row.get("ts") or 0) - int(last.get("ts") or 0) <= gap):
             last["text"] = f"{last['text']} / {text}"
             last["ts_end"] = int(row.get("ts") or 0)
+            # ⚠️ 附件必须跟着合并：不然「图片是下一条发的」就整张丢了，
+            # 而通知群最常见的排版正是「一句话 + 一张截图」分两条发。
+            last["media"] = list(last.get("media") or []) + list(row.get("media") or [])
             continue
         item = dict(row)
         item["ts_end"] = int(row.get("ts") or 0)
+        item["media"] = list(row.get("media") or [])
         out.append(item)
     return out
 
@@ -126,15 +130,24 @@ def build(rows: Iterable[dict], *, clean_cfg: dict, max_chars: int) -> dict:
         "raw": len(rows),
         "kept": len(lines),
         "sampled": sampled,
+        # 留下来的原始行：附件标注要按它们重新渲染（见 service.summarize）
+        "rows": [item["row"] for item in items],
     }
 
 
-SYSTEM_PROMPT = """你是通知群消息整理助手。用户会给你一段 QQ 群聊天记录（可能带[@某某]与[图片]/[文件]占位），
-你要从中抽出「需要有人去做的事」。
+SYSTEM_PROMPT = """你是 QQ 群消息整理助手。用户会给你一段群聊记录（可能带 [@某某] 和 [图N] /
+[文件N:名字] 标记，后面还会附上这些图片与附件的解析内容）。请输出**两部分**：
 
-规则：
+一、群内容摘要（`summary` + `points`）—— 这段群聊到底发生了什么：
+1. `summary` 用 2~3 句话讲清楚整体：这群人在讨论什么、发了什么通知、有没有结论。
+   写成人话，不要「大家积极讨论了…」这种空话。
+2. `points` 列 0~6 条**有信息量的要点**：明确的决定、时间地点、数字、结论、
+   谁问了什么得到什么答复。每条不超过 40 字，按重要性排。
+3. 纯灌水、表情、「收到」这类不要写进要点；如果整段没什么内容，`points` 给空数组。
+
+二、待办（`todos`）—— 需要有人去做的具体事项：
 1. 只抽**有明确行动要求**的事项：报名、提交、截止、开会、领取、缴费、确认回复、填表、打卡等；
-   纯通知（已结束的、无需行动的）、闲聊、情绪表达都不算。
+   纯通知（已结束的、无需行动的）不算。
 2. 同一件事重复出现（多人复述、催办）合并成**一条**。
 3. `owner` 只填记录里**明确**提到的责任人（@某人、某部门、某班、某组）；没提到就留空字符串，不要猜。
 4. `due` 填绝对时间 `YYYY-MM-DD HH:MM`；只有「本周五」「明晚」这类相对说法时按记录里的日期换算；
@@ -144,15 +157,20 @@ SYSTEM_PROMPT = """你是通知群消息整理助手。用户会给你一段 QQ 
 7. `evidence` 抄一句原始消息里最关键的话（不超过 40 字），便于溯源。
 8. 最多输出 {max_todos} 条，按紧急程度从高到低排。
 
-只输出 JSON，不要解释，不要 markdown 代码围栏：
-{"todos":[{"title":"","owner":"","due":"","priority":"normal","evidence":""}]}
+图片要当作通知的一部分来读（截图里常有关键的表格、时间、名单）；
+如果图片模糊或与内容无关，忽略即可，不要瞎猜。附件内容同理。
 
-如果确实没有任何待办，输出 {"todos":[]}。"""
+只输出 JSON，不要解释，不要 markdown 代码围栏：
+{"summary":"","points":[""],"todos":[{"title":"","owner":"","due":"","priority":"normal","evidence":""}]}
+
+没有任何待办时 `todos` 给空数组；整段没内容时 `summary` 写一句「这段时间群里没有实质内容」。"""
 
 
 def build_chat_messages(*, group_name: str, digest: dict,
-                        start_ts: int, end_ts: int, max_todos: int) -> list[dict]:
-    """拼成 OpenAI 兼容的 `messages`。"""
+                        start_ts: int, end_ts: int, max_todos: int,
+                        files_section: str = "", images: list = None,
+                        image_note: str = "") -> list[dict]:
+    """拼成 OpenAI 兼容的 `messages`（有图片时是 multimodal 的 content 数组）。"""
     span = (f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(start_ts))} ~ "
             f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(end_ts))}")
     head = [
@@ -163,10 +181,22 @@ def build_chat_messages(*, group_name: str, digest: dict,
         "以下是聊天记录：",
     ]
     user = "\n".join(head) + "\n\n" + digest["text"]
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT.replace("{max_todos}", str(max_todos))},
-        {"role": "user", "content": user},
-    ]
+    if files_section:
+        user += "\n" + files_section
+    if image_note:
+        user += image_note
+
+    system = {"role": "system",
+              "content": SYSTEM_PROMPT.replace("{max_todos}", str(max_todos))}
+    if not images:
+        return [system, {"role": "user", "content": user}]
+
+    content: list[dict] = [{"type": "text", "text": user}]
+    for item in images:
+        content.append({"type": "text", "text": f"[{item['label']}]"})
+        content.append({"type": "image_url",
+                        "image_url": {"url": item["data_uri"], "detail": "low"}})
+    return [system, {"role": "user", "content": content}]
 
 
 __all__ = [

@@ -82,6 +82,7 @@ async def push_group(plugin, group_id, *, now: int = 0) -> bool:
         plugin.update_group(group_id, last_push_date=_today(now))
         result = await service.summarize(plugin, group_id,
                                          start_ts=start_ts, end_ts=end_ts,
+                                         mode=plugin.mode_for(group_id),
                                          catch_up_pages=CATCHUP_PAGES)
         if result.get("empty"):
             plugin.logger.info("[qqnotice_sum] 群 %s 定时总结没有可总结的消息，跳过推送",

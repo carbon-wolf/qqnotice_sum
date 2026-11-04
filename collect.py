@@ -90,6 +90,58 @@ def segments_to_text(message: Any, *, self_id: int = 0) -> tuple[str, str]:
     if not isinstance(message, list):
         return "", "text"
 
+    text, kind, _media = render_segments(message, self_id=self_id)
+    return text, kind
+
+
+#: 一条消息里最多记几个附件（防卡片新闻那种一次几十张图）
+MAX_MEDIA_PER_MESSAGE = 6
+
+
+def media_of_segments(message: Any) -> list[dict]:
+    """消息里的图片 / 文件描述（**不下载**，只留坐标）。
+
+    采集阶段只存这些元信息，真正下载与解析留到总结时 —— 采集要轻，
+    而且下载会用到 API 节流额度，不该在收消息的路径上做。
+    """
+    if not isinstance(message, list):
+        return []
+    items: list[dict] = []
+    for seg in message:
+        if not isinstance(seg, dict) or len(items) >= MAX_MEDIA_PER_MESSAGE:
+            break
+        seg_type = str(seg.get("type") or "")
+        data = seg.get("data") or {}
+        if not isinstance(data, dict):
+            continue
+        if seg_type == "image":
+            items.append({
+                "kind": "image",
+                "file": str(data.get("file") or ""),
+                "file_id": str(data.get("file_id") or ""),
+                "url": str(data.get("url") or ""),
+                "name": "",
+                "size": _as_int(data.get("file_size") or data.get("size")),
+            })
+        elif seg_type == "file":
+            items.append({
+                "kind": "file",
+                "file": str(data.get("file") or ""),
+                "file_id": str(data.get("file_id") or ""),
+                "url": str(data.get("url") or ""),
+                "name": str(data.get("name") or data.get("file") or "").strip(),
+                "size": _as_int(data.get("size") or data.get("file_size")),
+            })
+    return [m for m in items if m.get("file") or m.get("file_id") or m.get("url")]
+
+
+def render_segments(message: Any, *, self_id: int = 0) -> tuple[str, str, list[dict]]:
+    """消息段数组 → `(文本, kind, 附件描述列表)`。"""
+    if isinstance(message, str):
+        return message.strip(), "text", []
+    if not isinstance(message, list):
+        return "", "text", []
+
     parts: list[str] = []
     rich = False
     for seg in message:
@@ -132,7 +184,15 @@ def segments_to_text(message: Any, *, self_id: int = 0) -> tuple[str, str]:
         parts.append(SEGMENT_LABELS.get(seg_type, f"[{seg_type or '未知'}]"))
 
     text = "".join(parts).strip()
-    return text, ("rich" if rich else "text")
+    return text, ("rich" if rich else "text"), media_of_segments(message)
+
+
+def _as_int(value, default: int = 0) -> int:
+    try:
+        num = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return num if num >= 0 else default
 
 
 def sender_name(sender: Any) -> str:
@@ -161,16 +221,17 @@ def event_row(event, *, self_id: int = 0) -> Optional[dict]:
         return None
     if group_id <= 0 or message_id <= 0:
         return None
-    text, kind = segments_to_text(getattr(event, "message", None), self_id=self_id)
-    if not text:
+    text, kind, media = render_segments(getattr(event, "message", None), self_id=self_id)
+    if not text and not media:
         return None
     return {
         "message_id": message_id,
         "seq": int(getattr(event, "message_seq", 0) or 0),
         "user_id": int(getattr(event, "user_id", 0) or 0),
         "sender": sender_name(getattr(event, "sender", None)),
-        "text": text,
+        "text": text or "[附件]",
         "kind": kind,
+        "media": media,
         "ts": int(getattr(event, "time", 0) or 0),
     }
 
@@ -185,8 +246,8 @@ def history_row(raw: dict) -> Optional[dict]:
         return None
     if message_id <= 0:
         return None
-    text, kind = segments_to_text(raw.get("message"))
-    if not text:
+    text, kind, media = render_segments(raw.get("message"))
+    if not text and not media:
         return None
     sender = raw.get("sender") if isinstance(raw.get("sender"), dict) else {}
     try:
@@ -202,13 +263,15 @@ def history_row(raw: dict) -> Optional[dict]:
         "seq": seq,
         "user_id": user_id,
         "sender": sender_name(sender) or (str(user_id) if user_id else ""),
-        "text": text,
+        "text": text or "[附件]",
         "kind": kind,
+        "media": media,
         "ts": int(raw.get("time") or 0),
     }
 
 
 __all__ = [
-    "SEGMENT_LABELS", "json_card_text", "segments_to_text",
+    "SEGMENT_LABELS", "MAX_MEDIA_PER_MESSAGE", "json_card_text",
+    "segments_to_text", "render_segments", "media_of_segments",
     "sender_name", "event_row", "history_row",
 ]

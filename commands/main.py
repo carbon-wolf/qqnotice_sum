@@ -39,6 +39,7 @@ CONFIG_ALIASES = {
     "time": "time", "push-time": "time", "时间": "time", "推送时间": "time",
     "push": "push", "推送": "push",
     "model": "model", "模型": "model",
+    "mode": "mode", "模式": "mode", "产出": "mode",
     "switch": "switch", "enabled": "switch", "开关": "switch", "启用": "switch",
     "default": "default", "默认": "default",
 }
@@ -125,11 +126,31 @@ async def _act_help(plugin, event, rest):
 # ------------------------------------------------------------------ 动作：总结
 
 async def _act_summary(plugin, event, rest):
-    gid, span, _tokens = _target(plugin, event, rest)
+    return await _run_summary(plugin, event, rest, default_mode="all")
+
+
+async def _act_digest(plugin, event, rest):
+    return await _run_summary(plugin, event, rest, default_mode="digest")
+
+
+async def _act_todo(plugin, event, rest):
+    return await _run_summary(plugin, event, rest, default_mode="todo")
+
+
+async def _run_summary(plugin, event, rest, *, default_mode: str):
+    """`summary` / `digest` / `todo` 三个动作共用的执行体。
+
+    参数顺序：`[群号] [窗口] [模式]`，都能省；只托管一个群时群号可省。
+    """
+    gid, span, tokens = _target(plugin, event, rest)
     if gid is None:
-        return _out(_need_group(plugin, "/sum summary <群号> [24h]"))
+        return _out(_need_group(plugin, "/sum summary <群号> [24h] [all|digest|todo]"))
     if not plugin.is_watched(gid):
         return _out(f"群 {gid} 没有托管。加进来：`/sum config add {gid}`")
+
+    mode = plugin.mode_for(gid) if default_mode == "all" else default_mode
+    if tokens:
+        mode = schemas.parse_mode(tokens[0], mode)
 
     now = int(time.time())
     last = plugin._last_summary.get(gid, 0)
@@ -143,7 +164,7 @@ async def _act_summary(plugin, event, rest):
         start_ts, end_ts = service.window_for(plugin, gid)
 
     result = await service.summarize(plugin, gid, start_ts=start_ts, end_ts=end_ts,
-                                     catch_up_pages=3)
+                                     mode=mode, catch_up_pages=3)
     return _out(render.result(plugin, gid, result))
 
 
@@ -368,6 +389,20 @@ async def _cfg_default(plugin, event, gid, args):
     return "默认值可以改：window / time / max"
 
 
+async def _cfg_mode(plugin, event, gid, args):
+    """该群默认产出什么：all / digest / todo。"""
+    gid = gid or _first_group_id(args)
+    if gid is None:
+        return _need_group(plugin, "/sum config mode <群号> all|digest|todo")
+    if not args:
+        return f"当前模式：{plugin.mode_for(gid)}（{service.mode_label(plugin.mode_for(gid))}）"
+    mode = schemas.parse_mode(args[0], "")
+    if mode not in service.MODES:
+        return "模式写 all / digest / todo 之一。"
+    plugin.update_group(gid, mode=mode)
+    return f"✅ 本群默认产出改成 {mode}（{service.mode_label(mode)}）。"
+
+
 def _first_group_id(args) -> Optional[int]:
     for token in args:
         gid = schemas.parse_group_id(token)
@@ -395,6 +430,8 @@ _ACTIONS = {
     "panel": _act_panel,
     "help": _act_help,
     "summary": _act_summary,
+    "digest": _act_digest,
+    "todo": _act_todo,
     "list": _act_list,
     "done": _act_done,
     "drop": _act_drop,
@@ -405,6 +442,7 @@ _ACTIONS = {
 
 _CONFIG_ACTIONS = {
     "add": _cfg_add,
+    "mode": _cfg_mode,
     "del": _cfg_del,
     "window": _cfg_window,
     "time": _cfg_time,

@@ -11,6 +11,7 @@ import time
 from . import store
 
 PRIORITY_TAG = {"high": "[高]", "normal": "", "low": "[低]"}
+MODE_LABEL = {"all": "摘要 + 待办", "digest": "只看摘要", "todo": "只看待办"}
 STATUS_LABEL = {"open": "未完成", "done": "已完成", "dropped": "已忽略"}
 
 
@@ -35,6 +36,18 @@ def span_text(start_ts: int, end_ts: int) -> str:
     return f"{clock(start_ts)} ~ {clock(end_ts)}"
 
 
+def _size(num: int) -> str:
+    try:
+        value = float(num)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
+            return f"{value:.0f}{unit}" if unit == "B" else f"{value:.0f}{unit}"
+        value /= 1024
+    return f"{value:.0f}GB"
+
+
 def group_title(plugin, group_id) -> str:
     """群显示名：配置里存的名字 > 群号。"""
     cfg = plugin.group_cfg(group_id)
@@ -57,7 +70,9 @@ def _todo_line(todo: dict) -> str:
 
 USAGE_LINES = [
     ("/sum", "这个面板"),
-    ("/sum summary [24h]", "现在总结一次；窗口可写 24h / 12h / today / yesterday / 3d"),
+    ("/sum summary [24h]", "总结一次：群内容摘要 + 待办；窗口可写 24h / today / 3d"),
+    ("/sum digest [24h]", "只看群内容摘要（发了什么通知、聊了什么、结论是什么）"),
+    ("/sum todo [24h]", "只看待办（跳过图片和附件，快且省 token）"),
     ("/sum list [all]", "未完成的待办（带 all 连已完成的一起列）"),
     ("/sum done <编号>", "标记完成，编号是列表里的 #数字"),
     ("/sum drop <编号>", "忽略某条（以后不再重复提醒）"),
@@ -96,30 +111,84 @@ def panel(plugin) -> str:
 
 # ------------------------------------------------------------------ 总结
 
-def summary(plugin, group_id, *, start_ts: int, end_ts: int, digest: dict,
-            todos: list[dict], model: str) -> str:
+def summary(plugin, group_id, res: dict) -> str:
+    """一次总结的完整报告：概要 / 要点 / 待办，按 mode 取舍。"""
+    start_ts = int(res.get("start_ts") or 0)
+    end_ts = int(res.get("end_ts") or 0)
+    mode = str(res.get("mode") or "all")
+    digest = res.get("digest") or {}
+    media = res.get("media") or {}
+
     lines = [f"📋 {group_title(plugin, group_id)} · {span_text(start_ts, end_ts)}"]
-    stat = f"消息 {digest['raw']} 条（去噪合并后 {digest['kept']} 条）"
+    stat = f"消息 {digest.get('raw', 0)} 条（去噪合并后 {digest.get('kept', 0)} 条）"
+    if media.get("images"):
+        stat += f" · 图 {media['images']}"
+    if media.get("files"):
+        stat += f" · 文件 {media['files']}"
     if digest.get("sampled"):
         stat += " · 已抽样"
-    lines.append(stat + (f" · {model}" if model else ""))
+    if res.get("model"):
+        stat += f" · {res['model']}"
+    lines.append(stat)
 
-    if todos:
+    if mode in ("all", "digest"):
+        text = str(res.get("summary") or "").strip()
+        if text:
+            lines.append("")
+            lines.append("【概要】")
+            lines.extend(_wrap(text))
+        points = res.get("points") or []
+        if points:
+            lines.append("")
+            lines.append("【要点】")
+            for idx, point in enumerate(points, 1):
+                lines.append(f"{idx}. {point}")
+
+    if mode in ("all", "todo"):
+        todos = res.get("todos") or []
+        if todos:
+            lines.append("")
+            lines.append("【待办】")
+            for idx, todo in enumerate(todos, 1):
+                tag = PRIORITY_TAG.get(str(todo.get("priority") or "normal"), "")
+                bits = []
+                if str(todo.get("owner") or "").strip():
+                    bits.append("@" + str(todo["owner"]).strip())
+                if str(todo.get("due") or "").strip():
+                    bits.append("截止 " + str(todo["due"]).strip())
+                lines.append(f"{idx}. {tag}{todo['title']}")
+                if bits:
+                    lines.append("   " + " · ".join(bits))
+        elif mode == "todo":
+            lines.append("")
+            lines.append("这段时间没有「需要有人去做」的事项。")
+
+    skipped = res.get("media_skipped") or []
+    if skipped:
         lines.append("")
-        for idx, todo in enumerate(todos, 1):
-            tag = PRIORITY_TAG.get(str(todo.get("priority") or "normal"), "")
-            bits = []
-            if str(todo.get("owner") or "").strip():
-                bits.append("@" + str(todo["owner"]).strip())
-            if str(todo.get("due") or "").strip():
-                bits.append("截止 " + str(todo["due"]).strip())
-            lines.append(f"{idx}. {tag}{todo['title']}")
-            if bits:
-                lines.append("   " + " · ".join(bits))
-    else:
-        lines.append("")
-        lines.append("这段时间没有「需要有人去做」的事项。")
+        lines.append("（附件跳过：" + "；".join(skipped[:3])
+                     + ("…" if len(skipped) > 3 else "") + "）")
     return "\n".join(lines)
+
+
+def _wrap(text: str, width: int = 60) -> list[str]:
+    """概要多半两三句，这里只在超长时按句子断，不硬折行。"""
+    text = text.strip()
+    if len(text) <= width * 3:
+        return [text]
+    parts, buf = [], ""
+    for sentence in text.replace("\n", " ").split("。"):
+        if not sentence.strip():
+            continue
+        piece = sentence.strip() + "。"
+        if len(buf) + len(piece) > width * 2:
+            parts.append(buf)
+            buf = piece
+        else:
+            buf += piece
+    if buf:
+        parts.append(buf)
+    return parts or [text]
 
 
 def unstructured(raw: str, *, digest: dict, start_ts: int, end_ts: int) -> str:
@@ -151,9 +220,7 @@ def result(plugin, group_id, res: dict) -> str:
     if not res.get("structured"):
         return unstructured(res.get("raw") or "", digest=res.get("digest") or {},
                             start_ts=start_ts, end_ts=end_ts)
-    return summary(plugin, group_id, start_ts=start_ts, end_ts=end_ts,
-                   digest=res.get("digest") or {}, todos=res.get("todos") or [],
-                   model=res.get("model") or "")
+    return summary(plugin, group_id, res)
 
 
 # ------------------------------------------------------------------ 列表
@@ -207,6 +274,7 @@ def config_overview(plugin) -> str:
         "  time 21:30            每天几点自动推送（off = 不定时）",
         "  push on|off           该群是否自动推送",
         "  model <名字>          该群用哪个模型（default = 跟随全局）",
+        "  mode all|digest|todo  该群默认产出（摘要 / 待办 / 都要）",
         "  switch on|off         该群是否继续采集",
         "  default …             改全局默认（仅超管）",
         "",
@@ -233,10 +301,15 @@ def settings(plugin, group_id) -> str:
     lines.append(f"  每日推送：{'开 · ' + push_time if push_time else '关'}")
     lines.append(f"  单次最多：{plugin.max_todos(group_id)} 条待办")
     lines.append(f"  模型：{plugin.model_for(group_id) or '跟随全局 ' + plugin.llm_cfg()['model']}")
+    mode = plugin.mode_for(group_id)
+    lines.append(f"  产出：{mode}（{MODE_LABEL.get(mode, '摘要 + 待办')}）")
+    mcfg = plugin.media_cfg()
+    lines.append(f"  图片：{'开 · 单张 ≤ ' + _size(mcfg['image']['max_bytes']) + ' · 每次 ≤ ' + str(mcfg['image']['max_per_run']) + ' 张' if mcfg['image']['enabled'] else '关'}")
+    lines.append(f"  文件：{'开 · 单个 ≤ ' + _size(mcfg['file']['max_bytes']) + ' · 每次 ≤ ' + str(mcfg['file']['max_per_run']) + ' 个' if mcfg['file']['enabled'] else '关'}")
     lines.append("")
     lines.append("修改：")
     lines.append("  /sum config window 24h　/sum config time 21:30　/sum config push off")
-    lines.append("  /sum config model deepseek-chat　/sum config switch off　/sum config del")
+    lines.append("  /sum config model deepseek-chat　/sum config mode digest　/sum config del")
     lines.append(f"  （全局默认：window {defaults['window_hours']}h · "
                  f"push {defaults['push_time'] or '关'}）")
     return "\n".join(lines)
@@ -263,7 +336,7 @@ def status(plugin) -> str:
         lines.append(f"    消息 {total} 条 · 未完成待办 {open_count} 条 · 上次同步 {last}")
         lines.append(f"    推送 {plugin.push_time(gid) or '关'} · "
                      f"采集{'开' if plugin.is_watched(gid) else '关'} · "
-                     f"窗口 {plugin.window_hours(gid)}h")
+                     f"窗口 {plugin.window_hours(gid)}h · 产出 {plugin.mode_for(gid)}")
     lines.append("")
     lines.append(f"  当前时间：{clock(now, '%Y-%m-%d %H:%M')}")
     return "\n".join(lines)
@@ -281,5 +354,5 @@ def _db_hint(plugin) -> str:
 __all__ = [
     "clock", "span_text", "group_title", "panel", "summary", "unstructured", "result",
     "todo_list", "closed_ack", "settings", "config_overview", "status",
-    "PRIORITY_TAG", "STATUS_LABEL",
+    "PRIORITY_TAG", "STATUS_LABEL", "MODE_LABEL",
 ]

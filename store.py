@@ -18,11 +18,16 @@ import re
 import time
 from typing import Iterable, Optional
 
-from napcat.store import AutoField, CharField, IntegerField, Model, TextField
+from napcat.store import (AutoField, CharField, IntegerField, JSONField, Model,
+                          TextField)
 
 
 class Msg(Model):
-    """一条群消息。`message_id` 唯一 —— 实时采集与历史补采会撞上同一批消息。"""
+    """一条群消息。`message_id` 唯一 —— 实时采集与历史补采会撞上同一批消息。
+
+    `media` 存这条消息带的图片/文件描述（`[{"kind","file","file_id","name","size","url"}]`），
+    真正下载与解析留到总结时做 —— 采集阶段不该碰网络。
+    """
 
     class Meta:
         table = "qs_msg"
@@ -35,7 +40,29 @@ class Msg(Model):
     sender = CharField(max_length=64, default="")
     text = TextField(default="")
     kind = CharField(max_length=16, default="text")
+    media = JSONField(default=list, null=True)
     ts = IntegerField(index=True, default=0)
+
+
+class Media(Model):
+    """附件解析缓存：同一个文件只下载/解析一次。
+
+    只缓存**文本**（图片不缓存 base64 —— 那会把库撑爆，而且每次总结都要重新发）。
+    """
+
+    class Meta:
+        table = "qs_media"
+
+    id = AutoField()
+    key = CharField(max_length=32, unique=True, index=True)   # f"{message_id}:{idx}"
+    message_id = IntegerField(index=True, default=0)
+    group_id = IntegerField(index=True, default=0)
+    kind = CharField(max_length=8, default="file")
+    name = CharField(max_length=200, default="")
+    size = IntegerField(default=0)
+    text = TextField(default="")
+    status = CharField(max_length=16, default="")             # ok / skip / error
+    fetched_at = IntegerField(default=0)
 
 
 class Todo(Model):
@@ -74,6 +101,10 @@ class Run(Model):
     todo_open = IntegerField(default=0)
     model = CharField(max_length=64, default="")
     cost_ms = IntegerField(default=0)
+    mode = CharField(max_length=8, default="all")
+    media_count = IntegerField(default=0)
+    summary = TextField(default="")
+    points = JSONField(default=list, null=True)
     created_at = IntegerField(index=True, default=0)
 
 
@@ -161,6 +192,7 @@ def save_messages(db, group_id, rows: Iterable[dict]) -> int:
                 sender=str(row.get("sender") or "")[:64],
                 text=str(row.get("text") or ""),
                 kind=str(row.get("kind") or "text")[:16],
+                media=row.get("media") or [],
                 ts=_as_int(row.get("ts")),
             )
     return len(pending)
@@ -291,11 +323,15 @@ def close_todo(todo_id: int, *, user_id: int = 0, status: str = "done",
 
 def record_run(group_id, *, start_ts: int, end_ts: int, msg_count: int,
                todo_new: int, todo_open: int, model: str, cost_ms: int,
+               mode: str = "all", media_count: int = 0,
+               summary: str = "", points: list = None,
                now: Optional[int] = None) -> Run:
     return Run.objects.create(
         group_id=int(group_id), start_ts=int(start_ts), end_ts=int(end_ts),
         msg_count=int(msg_count), todo_new=int(todo_new), todo_open=int(todo_open),
         model=str(model or "")[:64], cost_ms=int(cost_ms),
+        mode=str(mode or "all")[:8], media_count=int(media_count),
+        summary=str(summary or ""), points=list(points or []),
         created_at=int(now if now is not None else time.time()),
     )
 
@@ -304,12 +340,45 @@ def last_run(group_id) -> Optional[Run]:
     return Run.objects.filter(group_id=int(group_id)).order_by("-id").first()
 
 
+# ------------------------------------------------------------------ 附件缓存
+
+def media_cache_get(key: str) -> Optional[Media]:
+    return Media.objects.filter(key=str(key)).first()
+
+
+def media_cache_put(*, key: str, message_id: int, group_id: int, kind: str,
+                    name: str, size: int, text: str, status: str,
+                    now: Optional[int] = None) -> Media:
+    """写缓存（有就更新）。`text` 只对文件有意义；图片只记状态。"""
+    stamp = int(now if now is not None else time.time())
+    row = Media.objects.filter(key=str(key)).first()
+    if row is None:
+        return Media.objects.create(
+            key=str(key), message_id=int(message_id), group_id=int(group_id),
+            kind=str(kind)[:8], name=str(name or "")[:200], size=_as_int(size),
+            text=str(text or ""), status=str(status)[:16], fetched_at=stamp)
+    row.kind = str(kind)[:8]
+    row.name = str(name or "")[:200]
+    row.size = _as_int(size)
+    row.text = str(text or "")
+    row.status = str(status)[:16]
+    row.fetched_at = stamp
+    row.save()
+    return row
+
+
+def purge_media(db, *, before_ts: int) -> int:
+    with db.atomic():
+        return Media.objects.filter(fetched_at__lt=int(before_ts)).delete()
+
+
 __all__ = [
-    "Msg", "Todo", "Run", "SyncState",
+    "Msg", "Todo", "Run", "SyncState", "Media",
     "normalize_title", "fingerprint",
     "existing_message_ids", "save_messages", "messages_between", "message_count",
     "latest_message_ts", "purge_messages",
     "sync_state", "touch_sync",
     "open_todos", "get_todo", "upsert_todos", "close_todo",
     "record_run", "last_run",
+    "media_cache_get", "media_cache_put", "purge_media",
 ]

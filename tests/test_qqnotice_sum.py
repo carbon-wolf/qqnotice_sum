@@ -35,7 +35,8 @@ from napcat.file_manager import FileManager                 # noqa: E402
 from napcat.models import MessageEvent, Sender              # noqa: E402
 from napcat.permission import PermissionManager             # noqa: E402
 
-from qqnotice_sum import collect, digest, history, llm, schemas, store         # noqa: E402
+from qqnotice_sum import (collect, digest, history, llm, media, schemas,   # noqa: E402
+                          store)
 from qqnotice_sum.commands import main as cmd_main                     # noqa: E402
 from qqnotice_sum.events import message as msg_event                   # noqa: E402
 from qqnotice_sum.plugin import QQNoticeSumPlugin                       # noqa: E402
@@ -178,6 +179,139 @@ def test_llm_parse() -> None:
           .get("priority") == "high")
 
 
+def test_media() -> None:
+    print("\n[附件]")
+    check("human_size 1.5MB", media.human_size(1572864) == "1.5MB", media.human_size(1572864))
+    check("human_size 800B", media.human_size(800) == "800B")
+
+    text, status = media.extract_text("通知.txt", "明天下午三点开会".encode("utf-8"),
+                                      max_chars=1000)
+    check("txt 直接解码", status == "ok" and "开会" in text)
+    text, status = media.extract_text("名单.csv", "姓名,学号\n张三,001".encode("gb18030"),
+                                      max_chars=1000)
+    check("gb18030 也能读", status == "ok" and "张三" in text)
+    text, status = media.extract_text("a.zip", b"PK\x03\x04", max_chars=1000)
+    check("不支持的格式标记 unsupported", status == "unsupported")
+    text, status = media.extract_text("长.txt", ("啊" * 500).encode(), max_chars=50)
+    check("按 max_chars 截断", len(text) <= 60, str(len(text)))
+
+    rows = [
+        {"message_id": 1, "text": "[图片][图片]", "media": [
+            {"kind": "image", "file": "a.jpg"}, {"kind": "image", "file": "b.jpg"}]},
+        {"message_id": 2, "text": "[文件:课表.xlsx]", "media": [
+            {"kind": "file", "name": "课表.xlsx", "file_id": "f1", "size": 1024}]},
+        {"message_id": 3, "text": "纯文字", "media": []},
+    ]
+    tagged, items = media.tag_rows(rows)
+    check("两张图分别编号", "[图1][图2]" in tagged[0]["text"], tagged[0]["text"])
+    check("文件带编号", "[文件1:课表.xlsx]" in tagged[1]["text"], tagged[1]["text"])
+    check("无附件行不动", tagged[2]["text"] == "纯文字")
+    check("附件清单 3 项", len(items) == 3)
+    check("index 记录位置", items[1]["index"] == 1)
+
+
+async def test_media_limits() -> None:
+    """文件大小 / 扩展名 / 数量上限都必须在**下载前**就挡住。"""
+    print("\n[附件上限]")
+    cfg = {"enabled": True, "timeout": 3, "cache_hours": 72,
+           "image": {"enabled": True, "max_bytes": 1024 * 1024, "max_per_run": 2},
+           "file": {"enabled": True, "max_bytes": 1024 * 1024, "max_per_run": 2,
+                    "max_chars": 100, "allow_ext": [".txt"]}}
+
+    class _P:
+        api = None
+
+    def item(name, size, label="文件1"):
+        return {"kind": "file", "label": label, "index": 0,
+                "descriptor": {"name": name, "size": size, "file_id": "f"},
+                "row": {"message_id": 1}}
+
+    out = await media.gather(_P(), 1, [item("大文件.txt", 10 * 1024 * 1024)], cfg=cfg)
+    check("超过文件上限直接跳过", not out["files"]
+          and any("超过文件上限" in msg for msg in out["skipped"]), str(out["skipped"]))
+
+    out = await media.gather(_P(), 1, [item("脚本.exe", 1024)], cfg=cfg)
+    check("扩展名不在白名单就跳过", not out["files"]
+          and any("不在允许列表" in msg for msg in out["skipped"]), str(out["skipped"]))
+
+    cfg_off = {**cfg, "file": {**cfg["file"], "enabled": False}}
+    out = await media.gather(_P(), 1, [item("笔记.txt", 100)], cfg=cfg_off)
+    check("关掉文件处理后什么都不做", not out["files"] and not out["skipped"])
+
+    cfg_img = {**cfg, "image": {**cfg["image"], "max_bytes": 1024}}
+    big_image = {"kind": "image", "label": "图1", "index": 0,
+                 "descriptor": {"file": "a.jpg", "size": 5 * 1024 * 1024},
+                 "row": {"message_id": 1}}
+    out = await media.gather(_P(), 1, [big_image], cfg=cfg_img)
+    check("超过图片上限就跳过", not out["images"]
+          and any("超过单张上限" in msg for msg in out["skipped"]), str(out["skipped"]))
+
+
+def test_report_parse() -> None:
+    print("\n[摘要解析]")
+    payload = {"summary": "群里通知周五停电。", "points": ["周五全天停电", "服务器提前关机"],
+               "todos": [{"title": "关机", "owner": "张三"}]}
+    got = llm.parse_report(json.dumps(payload, ensure_ascii=False))
+    check("summary 解析", got and got["summary"].startswith("群里通知"))
+    check("points 解析", got and len(got["points"]) == 2)
+    check("todos 解析", got and got["todos"][0]["title"] == "关机")
+    check("只有待办也能解析", llm.parse_report('{"todos":[]}') ==
+          {"summary": "", "points": [], "todos": []})
+
+    msgs = [{"role": "user", "content": [
+        {"type": "text", "text": "记录"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]}]
+    check("识别带图消息", llm.has_images(msgs) is True)
+    stripped = llm.strip_images(msgs)
+    check("降级后没有图片", llm.has_images(stripped) is False)
+    check("降级后保留原文", "记录" in stripped[0]["content"])
+
+
+def test_mode() -> None:
+    print("\n[产出模式]")
+    check("all", schemas.parse_mode("all") == "all")
+    check("digest", schemas.parse_mode("digest") == "digest")
+    check("摘要（别名）", schemas.parse_mode("摘要") == "digest")
+    check("todo", schemas.parse_mode("todo") == "todo")
+    check("乱写回落默认", schemas.parse_mode("xxx", "all") == "all")
+    check("digest 动作", schemas.parse_spec(["digest", "24h"]) == ("digest", ["24h"]))
+    check("todo 动作", schemas.parse_spec(["todo"]) == ("todo", []))
+
+
+def test_upgrade() -> None:
+    """老库（1.1.0 没有 media/points 列）能不能原地升级。"""
+    print("\n[老库升级]")
+    import sqlite3
+    from napcat.store import Database
+
+    tmp = Path(tempfile.mkdtemp(prefix="qqnotice-sum-upgrade-")) / "old.db"
+    con = sqlite3.connect(str(tmp))
+    con.executescript("""
+        CREATE TABLE qs_msg (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL UNIQUE, seq INTEGER NOT NULL DEFAULT 0,
+            user_id INTEGER NOT NULL DEFAULT 0, sender TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL DEFAULT '', kind TEXT NOT NULL DEFAULT 'text',
+            ts INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE qs_run (id INTEGER PRIMARY KEY AUTOINCREMENT, group_id INTEGER NOT NULL,
+            start_ts INTEGER NOT NULL DEFAULT 0, end_ts INTEGER NOT NULL DEFAULT 0,
+            msg_count INTEGER NOT NULL DEFAULT 0, todo_new INTEGER NOT NULL DEFAULT 0,
+            todo_open INTEGER NOT NULL DEFAULT 0, model TEXT NOT NULL DEFAULT '',
+            cost_ms INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0);
+        INSERT INTO qs_msg (group_id, message_id, text, ts) VALUES (1, 100, '老消息', 1);
+        INSERT INTO qs_run (group_id, created_at) VALUES (1, 1);
+    """)
+    con.commit()
+    con.close()
+
+    db = Database(tmp).register(store.Msg, store.Todo, store.Run,
+                                store.SyncState, store.Media)
+    check("老数据没丢", store.Msg.objects.filter(group_id=1).count() == 1)
+    check("新列 media 可读", store.Msg.objects.filter(group_id=1).first().media is None)
+    store.save_messages(db, 1, [{"message_id": 101, "text": "新消息", "media": [], "ts": 2}])
+    check("新消息能写", store.message_count(1) == 2)
+    check("老 run 能读", store.last_run(1).created_at == 1)
+
+
 # ------------------------------------------------------------------ 端到端
 
 def _group_event(text: str = "", *, mid: int = 1, uid: int = MEMBER,
@@ -189,6 +323,18 @@ def _group_event(text: str = "", *, mid: int = 1, uid: int = MEMBER,
         user_id=uid, group_id=gid,
         sender=Sender(user_id=uid, nickname=f"用户{uid}", card=f"用户{uid}", role=role),
         message=[{"type": "text", "data": {"text": text}}] if text else [],
+    )
+
+
+def _group_event_raw(segments: list, *, mid: int = 1, uid: int = MEMBER,
+                     gid: int = GROUP) -> MessageEvent:
+    """带指定消息段的群消息（测图片/文件用）。"""
+    return MessageEvent(
+        time=int(time.time()), self_id=SUPER, post_type="message",
+        message_type="group", message_id=mid, message_seq=mid,
+        user_id=uid, group_id=gid,
+        sender=Sender(user_id=uid, nickname=f"用户{uid}", card=f"用户{uid}", role="owner"),
+        message=segments,
     )
 
 
@@ -279,12 +425,22 @@ async def test_end_to_end() -> None:
     await msg_event.record(plugin, _group_event(texts[0], mid=10))
     check("重复 message_id 去重", store.message_count(GROUP) == 3)
 
+    # 带图的消息：占位符要变成 [图1]，并进模型上下文
+    await msg_event.record(plugin, _group_event_raw([
+        {"type": "text", "data": {"text": "课表看图"}},
+        {"type": "image", "data": {"file": "abc.jpg", "url": "http://127.0.0.1:1/x.jpg"}},
+    ], mid=13))
+    check("带图消息也入库", store.message_count(GROUP) == 4,
+          f"实际 {store.message_count(GROUP)}")
+
     # ---- 假模型
     calls = []
 
     async def fake_chat(p, messages, *, model=""):
         calls.append(messages)
-        return json.dumps({"todos": [
+        return json.dumps({"summary": "群里通知两件事：交开题报告、周五开会。",
+                           "points": ["开题报告明天 17:00 前交", "周五 15:00 在 302 开会"],
+                           "todos": [
             {"title": "提交开题报告", "owner": "张三", "due": "2026-11-05 17:00",
              "priority": "high", "evidence": "明天下午五点前交"},
             {"title": "参加 302 会议", "owner": "", "due": "2026-11-06 15:00",
@@ -298,7 +454,19 @@ async def test_end_to_end() -> None:
         reply = await _cmd(plugin, ["summary", "24h"])
         check("单群时群号可省", "提交开题报告" in reply, reply[:120])
         check("总结带截止时间", "截止 2026-11-05 17:00" in reply)
+        check("报告含【概要】", "【概要】" in reply, reply[:80])
+        check("报告含【要点】", "【要点】" in reply)
+        check("报告含【待办】", "【待办】" in reply)
+
+        digest_reply = await _cmd(plugin, ["digest"])
+        check("digest 只有摘要", "【概要】" in digest_reply and "【待办】" not in digest_reply,
+              digest_reply[:80])
+        todo_reply = await _cmd(plugin, ["todo"])
+        check("todo 只有待办", "【待办】" in todo_reply and "【概要】" not in todo_reply,
+              todo_reply[:80])
         check("模型收到了群消息", calls and "开题报告" in calls[0][1]["content"])
+        check("图片被标成 [图1]", bool(calls) and "[图1]" in calls[0][1]["content"],
+              (calls[0][1]["content"][:120] if calls else ""))
         check("待办入库 2 条", len(store.open_todos(GROUP)) == 2)
 
         await _cmd(plugin, ["summary"])
@@ -393,6 +561,11 @@ def main() -> int:
     test_collect()
     test_digest()
     test_llm_parse()
+    test_media()
+    asyncio.run(test_media_limits())
+    test_report_parse()
+    test_mode()
+    test_upgrade()
     try:
         asyncio.run(test_end_to_end())
     except Exception:                          # noqa: BLE001 - 测试脚本：打印后继续统计

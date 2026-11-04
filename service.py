@@ -1,38 +1,50 @@
 # -*- coding: utf-8 -*-
 """总结流程 —— 手动命令与定时推送共用同一条链路。
 
-顺序固定：补采缺口 → 取窗口内消息 → 清洗 → 调模型 → 解析 → 入库 → 回结构化结果。
-把这段独立出来，是为了让「有人在群里按 `/sum 看`」和「晚上 9 点半自动推」走
+顺序固定：
+
+    补采缺口 → 取窗口内消息 → 清洗合并裁剪 → 标注附件 → 取图/解析文件
+    → 调模型（带图） → 解析 → 待办入库 → 回结构化结果
+
+把这段独立出来，是为了让「私聊 `/sum summary`」和「晚上 9 点半自动推」走
 **完全一样**的逻辑（包括去重与指纹），否则两边的待办会各算一套。
 """
 from __future__ import annotations
 
 import time
-from typing import Optional
 
-from . import digest, history, llm, store
+from . import digest, history, llm, media, store
+
+#: 三种产出模式
+MODES = ("all", "todo", "digest")
+
+
+def mode_label(mode: str) -> str:
+    return {"todo": "只看待办", "digest": "只看摘要"}.get(mode, "摘要 + 待办")
 
 
 async def summarize(plugin, group_id: int, *, start_ts: int, end_ts: int,
-                    model: str = "", catch_up_pages: int = 3) -> dict:
+                    model: str = "", mode: str = "all",
+                    catch_up_pages: int = 3) -> dict:
     """跑一次总结。
 
+    Args:
+        mode: `all`（摘要 + 待办）/ `todo`（只要待办，跳过图片与附件）/
+              `digest`（只要摘要，待办照样入库但不渲染）。
+
     Returns:
-        dict:
-            `ok`         是否拿到结构化结果
-            `empty`      这段时间没消息（`reason`: no_messages / all_noise）
-            `structured` 模型是否按 JSON 输出
-            `raw`        模型原文（未结构化时给用户看）
-            `digest`     清洗统计（raw / kept / sampled）
-            `todos`      待办列表
-            `created` / `open` 新增条数 / 当前未完成总数
-            `model` / `cost_ms` / `start_ts` / `end_ts`
+        dict: `ok / empty / structured / raw / digest / summary / points / todos /
+               created / open / model / cost_ms / mode / media / media_skipped`
     """
     gid = int(group_id)
+    mode = mode if mode in MODES else "all"
     base = {"ok": False, "empty": False, "structured": False, "raw": "",
             "digest": {"raw": 0, "kept": 0, "sampled": False},
-            "todos": [], "created": 0, "open": 0, "model": "",
-            "cost_ms": 0, "start_ts": int(start_ts), "end_ts": int(end_ts)}
+            "summary": "", "points": [], "todos": [],
+            "created": 0, "open": 0, "model": "",
+            "cost_ms": 0, "mode": mode,
+            "start_ts": int(start_ts), "end_ts": int(end_ts),
+            "media": {"images": 0, "files": 0}, "media_skipped": []}
 
     # 1) 先把缺口补上（掉线 / 刚装插件 / 上一轮定时失败）
     try:
@@ -50,35 +62,58 @@ async def summarize(plugin, group_id: int, *, start_ts: int, end_ts: int,
 
     clean_cfg = plugin.clean_cfg()
     llm_cfg = plugin.llm_cfg()
+    media_cfg = plugin.media_cfg()
     data = digest.build(rows, clean_cfg=clean_cfg,
                         max_chars=llm_cfg["max_context_chars"])
     if not data["lines"]:
         return {**base, "empty": True, "reason": "all_noise", "digest": data}
 
-    # 3) 调模型
+    # 3) 标注附件并按编号重排文本（[图片] → [图1]，[文件:x] → [文件1:x]）
+    media_out = {"images": [], "files": [], "skipped": [], "notes": []}
+    if mode != "todo" and media_cfg.get("enabled", True):
+        tagged, items = media.tag_rows(data.get("rows") or [])
+        if items:
+            data = dict(data)
+            data["text"] = "\n".join(digest.format_line(row) for row in tagged)
+            try:
+                media_out = await media.gather(plugin, gid, items, cfg=media_cfg)
+            except Exception as e:         # noqa: BLE001 - 附件失败不该让总结失败
+                plugin.logger.warning("[qqnotice_sum] 附件处理失败（群 %s）：%s", gid, e)
+
+    # 4) 调模型
     use_model = (model or plugin.model_for(gid) or llm_cfg["model"]).strip()
     messages = digest.build_chat_messages(
         group_name=_group_name(plugin, gid), digest=data,
-        start_ts=start_ts, end_ts=end_ts, max_todos=plugin.max_todos(gid))
+        start_ts=start_ts, end_ts=end_ts, max_todos=plugin.max_todos(gid),
+        files_section=media.build_file_section(media_out["files"]),
+        images=media_out["images"],
+        image_note=media.image_note(media_out["images"]))
     started = time.time()
     raw = await llm.chat(plugin, messages, model=use_model)
     cost_ms = int((time.time() - started) * 1000)
 
     result = {**base, "raw": raw, "digest": data, "model": use_model,
-              "cost_ms": cost_ms}
+              "cost_ms": cost_ms,
+              "media": {"images": len(media_out["images"]),
+                        "files": len(media_out["files"])},
+              "media_skipped": list(media_out.get("skipped") or [])}
 
-    # 4) 解析；解析不出来就明确告诉用户「这次没结构化」，不假装成功
-    todos = llm.parse_todos(raw)
-    if todos is None:
+    # 5) 解析；解析不出来就明确告诉用户「这次没结构化」，不假装成功
+    report = llm.parse_report(raw)
+    if report is None:
         return result
-    result["todos"] = todos
+    result["summary"] = report["summary"]
+    result["points"] = report["points"]
+    result["todos"] = report["todos"]
     result["structured"] = True
 
-    # 5) 入库（指纹去重，跨多次总结不会重复计数）
+    # 6) 待办入库（指纹去重，跨多次总结不会重复计数）
     run = store.record_run(gid, start_ts=start_ts, end_ts=end_ts,
                            msg_count=data["kept"], todo_new=0, todo_open=0,
-                           model=use_model, cost_ms=cost_ms)
-    created, open_total = store.upsert_todos(gid, todos, run_id=run.pk)
+                           model=use_model, cost_ms=cost_ms, mode=mode,
+                           media_count=len(media_out["images"]) + len(media_out["files"]),
+                           summary=report["summary"], points=report["points"])
+    created, open_total = store.upsert_todos(gid, report["todos"], run_id=run.pk)
     run.todo_new = created
     run.todo_open = open_total
     run.save()
@@ -101,4 +136,4 @@ def _group_name(plugin, group_id) -> str:
     return str(cfg.get("name") or "").strip() or str(group_id)
 
 
-__all__ = ["summarize", "window_for"]
+__all__ = ["summarize", "window_for", "MODES", "mode_label"]

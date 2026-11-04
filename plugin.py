@@ -33,7 +33,7 @@ from pathlib import Path
 
 from napcat.plugin import PluginBase
 
-from .store import Msg, Run, SyncState, Todo
+from .store import Media, Msg, Run, SyncState, Todo
 
 DEFAULT_WINDOW_HOURS = 24
 DEFAULT_PUSH_TIME = "21:30"
@@ -46,7 +46,7 @@ COMMAND_NAME = "sum"
 
 class QQNoticeSumPlugin(PluginBase):
     name = "qqnotice_sum"
-    version = "1.1.0"
+    version = "1.2.0"
     description = "通知群消息 → 待办：实时采集 + 历史补采，私聊查询 / 每日推送"
     author = "carbon-wolf"
 
@@ -65,7 +65,7 @@ class QQNoticeSumPlugin(PluginBase):
         except Exception as e:                    # noqa: BLE001 - 目录建不出来也不该让插件消失
             self.logger.warning("[qqnotice_sum] 建 data 目录失败：%s", e)
         # 框架提供的 sqlite 库：注册模型 = 建表 + 绑定，之后 Model.objects 就能用
-        self.database(ensure=[Msg, Todo, Run, SyncState])
+        self.database(ensure=[Msg, Todo, Run, SyncState, Media])
         self.logger.info("[qqnotice_sum] 已加载，托管群 %d 个", len(self.group_ids()))
 
 
@@ -100,9 +100,33 @@ class QQNoticeSumPlugin(PluginBase):
                 "window_hours": DEFAULT_WINDOW_HOURS,
                 "push_time": DEFAULT_PUSH_TIME,
                 "max_todos": DEFAULT_MAX_TODOS,
+                "mode": "all",              # all / digest / todo
             },
             # 群号 → 该群的采集/推送设置。空 = 一个群都不托管。
             "groups": {},
+            # 图片与附件的取用：默认开，但都有硬上限 —— 一个 200MB 的压缩包
+            # 不该把内存和 token 一起吃掉。
+            "media": {
+                "enabled": True,
+                "timeout": 45,
+                "cache_hours": 72,
+                "image": {
+                    "enabled": True,
+                    "max_bytes": 3 * 1024 * 1024,
+                    "max_per_run": 8,
+                },
+                "file": {
+                    "enabled": True,
+                    "max_bytes": 10 * 1024 * 1024,
+                    "max_per_run": 3,
+                    "max_chars": 6000,
+                    "allow_ext": [
+                        ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".log",
+                        ".ini", ".cfg", ".yaml", ".yml", ".xml", ".html", ".htm",
+                        ".pdf", ".docx", ".xlsx",
+                    ],
+                },
+            },
             "clean": {
                 "noise": ["收到", "好的", "谢谢", "1", "ok", "嗯嗯", "打卡", "已阅"],
                 "min_len": 2,
@@ -164,6 +188,7 @@ class QQNoticeSumPlugin(PluginBase):
             "window_hours": _positive_int(block.get("window_hours"), DEFAULT_WINDOW_HOURS),
             "push_time": _clock(block.get("push_time"), DEFAULT_PUSH_TIME),
             "max_todos": _positive_int(block.get("max_todos"), DEFAULT_MAX_TODOS),
+            "mode": str(block.get("mode") or "all").strip().lower(),
         }
 
     def window_hours(self, group_id) -> int:
@@ -185,6 +210,13 @@ class QQNoticeSumPlugin(PluginBase):
 
     def model_for(self, group_id) -> str:
         return str(self.group_cfg(group_id).get("model") or "").strip()
+
+    def mode_for(self, group_id) -> str:
+        """该群的默认产出模式：群配置 > 全局默认。"""
+        mode = str(self.group_cfg(group_id).get("mode") or "").strip().lower()
+        if mode in ("all", "digest", "todo"):
+            return mode
+        return self.mode_default()
 
     def llm_cfg(self) -> dict:
         raw = self.config.get("llm")
@@ -210,6 +242,36 @@ class QQNoticeSumPlugin(PluginBase):
             "retention_days": _positive_int(block.get("retention_days"), DEFAULT_RETENTION_DAYS),
         }
 
+    def media_cfg(self) -> dict:
+        """图片/附件的取用上限。每一项都兜底 —— 少写一个键不该让总结挂掉。"""
+        raw = self.config.get("media")
+        block = raw if isinstance(raw, dict) else {}
+        image = block.get("image") if isinstance(block.get("image"), dict) else {}
+        file = block.get("file") if isinstance(block.get("file"), dict) else {}
+        allow = file.get("allow_ext")
+        return {
+            "enabled": bool(block.get("enabled", True)),
+            "timeout": _positive_int(block.get("timeout"), 45),
+            "cache_hours": _positive_int(block.get("cache_hours"), 72, minimum=0),
+            "image": {
+                "enabled": bool(image.get("enabled", True)),
+                "max_bytes": _positive_int(image.get("max_bytes"), 3 * 1024 * 1024),
+                "max_per_run": _positive_int(image.get("max_per_run"), 8, minimum=0),
+            },
+            "file": {
+                "enabled": bool(file.get("enabled", True)),
+                "max_bytes": _positive_int(file.get("max_bytes"), 10 * 1024 * 1024),
+                "max_per_run": _positive_int(file.get("max_per_run"), 3, minimum=0),
+                "max_chars": _positive_int(file.get("max_chars"), 6000),
+                "allow_ext": ([str(x).lower() for x in allow]
+                              if isinstance(allow, (list, tuple)) else []),
+            },
+        }
+
+    def mode_default(self) -> str:
+        """全局默认产出模式（`all` / `digest` / `todo`）。"""
+        return self.defaults().get("mode") or "all"
+
     def history_cfg(self) -> dict:
         raw = self.config.get("history")
         block = raw if isinstance(raw, dict) else {}
@@ -230,6 +292,7 @@ class QQNoticeSumPlugin(PluginBase):
             "push_time": base["push_time"],
             "push": True,
             "model": "",
+            "mode": "",
             "last_push_date": "",
         }
 

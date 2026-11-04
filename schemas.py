@@ -25,14 +25,17 @@ class SumSchema(CommandSchema):
     """`/sum [action] [args ...]`"""
 
     spec = VariadicField(
-        description="action + args：留空=面板；summary [窗口] / list [all] / done <编号> / "
+        description="action + args：留空=面板；summary [窗口] [all|digest|todo] / "
+                    "digest [窗口] / todo [窗口] / list [all] / done <编号> / "
                     "drop <编号> / sync [窗口] / config … / status")
 
 
 #: 动作别名 → 内部动作名（英文为主，中文是别名）
 ACTION_ALIASES = {
-    "summary": "summary", "sum": "summary", "s": "summary",
+    "summary": "summary", "sum": "summary", "s": "summary", "report": "summary",
     "看": "summary", "总结": "summary", "看看": "summary",
+    "digest": "digest", "abstract": "digest", "摘要": "digest", "内容": "digest",
+    "todo": "todo", "todos": "todo", "待办": "todo",
     "list": "list", "ls": "list", "l": "list",
     "列表": "list", "清单": "list",
     "done": "done", "d": "done", "完": "done", "完成": "done",
@@ -43,6 +46,18 @@ ACTION_ALIASES = {
     "status": "status", "状态": "status",
     "help": "help", "帮助": "help", "?": "help",
 }
+
+#: 产出模式别名
+MODE_ALIASES = {
+    "all": "all", "both": "all", "全部": "all", "都要": "all", "综合": "all",
+    "digest": "digest", "summary": "digest", "摘要": "digest", "内容": "digest",
+    "todo": "todo", "todos": "todo", "待办": "todo", "任务": "todo",
+}
+
+
+def parse_mode(text, default: str = "all") -> str:
+    """产出模式：`all` / `digest` / `todo`；认不出来返回默认。"""
+    return MODE_ALIASES.get(str(text or "").strip().lower(), default)
 
 #: 窗口单位 → 秒
 _UNITS = {
@@ -177,6 +192,7 @@ def window_hours(text) -> Optional[int]:
 
 
 __all__ = [
-    "SumSchema", "ACTION_ALIASES", "tokenize", "parse_spec", "parse_hhmm",
-    "parse_bool", "parse_number", "parse_group_id", "parse_window", "window_hours",
+    "SumSchema", "ACTION_ALIASES", "MODE_ALIASES", "tokenize", "parse_spec",
+    "parse_mode", "parse_hhmm", "parse_bool", "parse_number", "parse_group_id",
+    "parse_window", "window_hours",
 ]
