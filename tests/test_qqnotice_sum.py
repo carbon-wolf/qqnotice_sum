@@ -1,0 +1,412 @@
+# -*- coding: utf-8 -*-
+"""qqnotice_sum 自测：不连 QQ、不连网。
+
+跑法（在框架根目录）：
+
+    ./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py
+
+覆盖两类：
+
+* **纯函数**：窗口解析、动作解析、清洗合并、指纹、JSON 兜底解析；
+* **端到端**：真建插件实例 + 框架 sqlite，喂假群消息 → 私聊发 `/sum` →
+  校验入库、去重、群号推断、完成动作。模型调用用假函数替换，不发网络请求。
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import sys
+import tempfile
+import time
+import traceback
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "plugins"))
+
+from napcat.client import GroupBinding                      # noqa: E402
+from napcat.command import CommandManager                   # noqa: E402
+from napcat.config import ConfigManager                     # noqa: E402
+from napcat.errors import ErrorReporter                     # noqa: E402
+from napcat.events import EventBus, TimerManager            # noqa: E402
+from napcat.file_manager import FileManager                 # noqa: E402
+from napcat.models import MessageEvent, Sender              # noqa: E402
+from napcat.permission import PermissionManager             # noqa: E402
+
+from qqnotice_sum import collect, digest, history, llm, schemas, store         # noqa: E402
+from qqnotice_sum.commands import main as cmd_main                     # noqa: E402
+from qqnotice_sum.events import message as msg_event                   # noqa: E402
+from qqnotice_sum.plugin import QQNoticeSumPlugin                       # noqa: E402
+from qqnotice_sum.schemas import SumSchema                             # noqa: E402
+
+GROUP = 987654321
+GROUP2 = 987654322
+SUPER = 999
+MEMBER = 123456
+
+_FAILED = []
+_PASSED = []
+
+
+def check(name: str, cond: bool, detail: str = "") -> None:
+    if cond:
+        _PASSED.append(name)
+        print(f"  ✓ {name}")
+    else:
+        _FAILED.append(name)
+        print(f"  ✗ {name}{(' — ' + detail) if detail else ''}")
+
+
+# ------------------------------------------------------------------ 纯函数
+
+def test_spec() -> None:
+    print("\n[动作解析]")
+    check("空 → 面板", schemas.parse_spec([]) == ("panel", []))
+    check("summary 24h", schemas.parse_spec(["summary", "24h"]) == ("summary", ["24h"]))
+    check("list all", schemas.parse_spec(["list", "all"]) == ("list", ["all"]))
+    check("done 12", schemas.parse_spec(["done", "12"]) == ("done", ["12"]))
+    check("config add", schemas.parse_spec(["config", "add", "123"]) == ("config", ["add", "123"]))
+    check("配置（中文别名）", schemas.parse_spec(["配置", "加群"])[0] == "config")
+    check("总结（中文别名）", schemas.parse_spec(["总结"])[0] == "summary")
+    check("不认识的动作", schemas.parse_spec(["阿巴阿巴"])[0] == "unknown")
+
+
+def test_window() -> None:
+    print("\n[窗口解析]")
+    now = int(time.time())
+    span = schemas.parse_window("24h", now=now)
+    check("24h = 一天", span is not None and abs((span[1] - span[0]) - 86400) <= 2)
+    span = schemas.parse_window("1d12h", now=now)
+    check("1d12h = 36 小时", span is not None and abs((span[1] - span[0]) - 129600) <= 2)
+    span = schemas.parse_window("90m", now=now)
+    check("90m = 5400 秒", span is not None and abs((span[1] - span[0]) - 5400) <= 2)
+    span = schemas.parse_window("today", now=now)
+    check("today 从 0 点起", span is not None and span[0] < now <= span[1])
+    span = schemas.parse_window("yesterday", now=now)
+    check("yesterday 是完整一天", span is not None and 86390 <= (span[1] - span[0]) <= 86410)
+    span = schemas.parse_window("all", now=now)
+    check("all 从 0 开始", span is not None and span[0] == 0)
+    check("乱写返回 None", schemas.parse_window("随便") is None)
+    check("window_hours(3d) = 72", schemas.window_hours("3d") == 72)
+
+
+def test_misc_parsers() -> None:
+    print("\n[其他解析]")
+    check("21:30", schemas.parse_hhmm("21:30") == "21:30")
+    check("9:5 → 09:05", schemas.parse_hhmm("9:5") == "09:05")
+    check("2130 → 21:30", schemas.parse_hhmm("2130") == "21:30")
+    check("关 → 空串", schemas.parse_hhmm("关") == "")
+    check("25:00 非法", schemas.parse_hhmm("25:00") is None)
+    check("on", schemas.parse_bool("on") is True)
+    check("off", schemas.parse_bool("off") is False)
+    check("群号 987654321", schemas.parse_group_id("987654321") == 987654321)
+    check("群号 123 太短", schemas.parse_group_id("123") is None)
+
+
+def test_collect() -> None:
+    print("\n[消息段文本化]")
+    text, kind = collect.segments_to_text([
+        {"type": "text", "data": {"text": "明天交报告"}},
+        {"type": "at", "data": {"qq": "111", "name": "李四"}},
+    ])
+    check("纯文本 kind=text", kind == "text" and "明天交报告" in text and "@李四" in text)
+    text, kind = collect.segments_to_text([
+        {"type": "image", "data": {"file": "a.jpg"}},
+        {"type": "text", "data": {"text": "看图"}},
+    ])
+    check("图片占位 + rich", kind == "rich" and "[图片]" in text)
+    text, _ = collect.segments_to_text([
+        {"type": "at", "data": {"qq": "999"}}, {"type": "text", "data": {"text": " 好"}}
+    ], self_id=999)
+    check("@机器人 渲染成 @我", "@我" in text)
+    card = json.dumps({"prompt": "[通知] 周五停电", "meta": {"news": {"desc": "全天"}}})
+    text, _ = collect.segments_to_text([{"type": "json", "data": {"data": card}}])
+    check("JSON 卡片捞出人话", "停电" in text and "全天" in text)
+    text, _ = collect.segments_to_text([{"type": "file", "data": {"name": "名单.xlsx"}}])
+    check("文件名保留", "名单.xlsx" in text)
+    check("空消息 → 空串", collect.segments_to_text([])[0] == "")
+
+
+def test_digest() -> None:
+    print("\n[清洗与合并]")
+    cfg = {"noise": ["收到", "好的", "1"], "min_len": 2, "merge_seconds": 300,
+           "max_msg_chars": 500}
+    base = int(time.time())
+    rows = [
+        {"sender": "张三", "text": "收到", "ts": base},
+        {"sender": "张三", "text": "明天交报告", "ts": base + 10},
+        {"sender": "张三", "text": "交到教务系统", "ts": base + 20},
+        {"sender": "李四", "text": "👌", "ts": base + 30},
+        {"sender": "李四", "text": "[表情]", "ts": base + 40},
+        {"sender": "王五", "text": "1", "ts": base + 50},
+        {"sender": "赵六", "text": "周五下午三点开会", "ts": base + 400},
+    ]
+    out = digest.build(rows, clean_cfg=cfg, max_chars=5000)
+    text = out["text"]
+    check("噪声被滤掉", "收到" not in text and "\n1" not in text)
+    check("纯表情被滤掉", "[表情]" not in text)
+    check("同一人连发被合并", "明天交报告 / 交到教务系统" in text)
+    check("另一人的消息另起一行", "周五下午三点开会" in text)
+    check("统计口径可用", out["raw"] == 7 and out["kept"] == 2)
+
+    long_rows = [{"sender": f"人{i}", "text": f"第{i}条消息内容" + "。" * 20,
+                  "ts": base + i * 60} for i in range(200)]
+    out = digest.build(long_rows, clean_cfg=cfg, max_chars=2000)
+    check("超预算会抽稀", out["sampled"] is True and len(out["text"]) <= 2400,
+          f"len={len(out['text'])}")
+
+    check("指纹稳定", store.fingerprint(1, "提交报告", "张三") ==
+          store.fingerprint(1, "提交 报告。", "张三"))
+    check("指纹区分责任人", store.fingerprint(1, "提交报告", "张三") !=
+          store.fingerprint(1, "提交报告", "李四"))
+
+
+def test_llm_parse() -> None:
+    print("\n[模型输出解析]")
+    payload = {"todos": [{"title": "交报告", "owner": "张三", "due": "2026-11-05 18:00",
+                          "priority": "high", "evidence": "明天交"}]}
+    got = llm.parse_todos(json.dumps(payload, ensure_ascii=False))
+    check("干净 JSON", got is not None and got[0]["title"] == "交报告")
+    fenced = "好的，结果如下：\n```json\n" + json.dumps(payload, ensure_ascii=False) + "\n```\n以上。"
+    check("带代码围栏 + 废话", (llm.parse_todos(fenced) or [{}])[0].get("title") == "交报告")
+    check("裸数组", len(llm.parse_todos('[{"title":"领书"}]') or []) == 1)
+    check("空待办", llm.parse_todos('{"todos":[]}') == [])
+    check("完全不是 JSON → None", llm.parse_todos("我觉得没什么事") is None)
+    check("中文优先级归一", (llm.parse_todos('[{"title":"x","priority":"高"}]') or [{}])[0]
+          .get("priority") == "high")
+
+
+# ------------------------------------------------------------------ 端到端
+
+def _group_event(text: str = "", *, mid: int = 1, uid: int = MEMBER,
+                 gid: int = GROUP, role: str = "owner") -> MessageEvent:
+    """群消息（采集用）。"""
+    return MessageEvent(
+        time=int(time.time()), self_id=SUPER, post_type="message",
+        message_type="group", message_id=mid, message_seq=mid,
+        user_id=uid, group_id=gid,
+        sender=Sender(user_id=uid, nickname=f"用户{uid}", card=f"用户{uid}", role=role),
+        message=[{"type": "text", "data": {"text": text}}] if text else [],
+    )
+
+
+def _private_event(text: str = "x", *, mid: int = 1, uid: int = SUPER) -> MessageEvent:
+    """私聊消息（发命令用）。"""
+    return MessageEvent(
+        time=int(time.time()), self_id=SUPER, post_type="message",
+        message_type="private", message_id=mid, message_seq=mid, user_id=uid,
+        sender=Sender(user_id=uid, nickname="admin"),
+        message=[{"type": "text", "data": {"text": text}}],
+    )
+
+
+class _FakeApi:
+    """模拟 NapCat 的 `get_group_msg_history`。
+
+    语义与真接口一致：`reverseOrder=True` 时返回**新→旧**；`message_seq` 是
+    「从这条往前（更旧）翻」的游标；数据按时间升序存着。
+    """
+
+    def __init__(self, messages: list[dict]):
+        self.all = messages
+
+    async def get_group_msg_history(self, group_id, *, count: int = 20,
+                                    message_seq=None, reverse_order: bool = False):
+        items = self.all
+        if message_seq:
+            index = next((i for i, m in enumerate(items)
+                          if m["message_seq"] == message_seq), len(items))
+            items = items[:index]               # 只要比游标更旧的
+        return {"messages": list(reversed(items[-int(count):]))}
+
+
+async def _cmd(plugin, args: list, event=None) -> str:
+    """跑一次命令，返回文本（`_out` 短文本回字符串）。"""
+    params = SumSchema().validate(list(args), {})
+    result = await cmd_main.cmd_sum(plugin, params, event or _private_event())
+    if isinstance(result, list):
+        return "\n".join(str(x) for x in result)
+    return result if isinstance(result, str) else ""
+
+
+async def test_end_to_end() -> None:
+    print("\n[端到端]")
+    tmp = Path(tempfile.mkdtemp(prefix="notice-todo-test-"))
+    (tmp / "plugin").mkdir(parents=True, exist_ok=True)
+    cfg = ConfigManager(str(tmp / "config.json"))
+    bus, timer = EventBus(), TimerManager()
+    timer.start()
+    perm = PermissionManager(superusers=[SUPER])
+    cmds = CommandManager(prefixes=["/"], perm_manager=perm)
+    logger = logging.getLogger("notice-todo-test")
+
+    plugin = QQNoticeSumPlugin(
+        api=None, event_bus=bus, timer=timer, cmd_manager=cmds, perm_manager=perm,
+        file_manager=FileManager(api=None), logger=logger,
+        groups=GroupBinding(bound=set(), all_groups=True), cfg=cfg,
+        client=None, error_reporter=ErrorReporter(logger=logger, perm=perm),
+        plugin_dir=str(tmp / "plugin"),
+    )
+    await plugin.on_load()
+    await plugin.on_enable()
+    cmd_main.COOLDOWN_SECONDS = 0            # 测试里连跑几次总结，不等冷却
+
+    # ---- 命令注册：权限与作用域必须是框架声明，而不是插件自己判
+    handlers = cmds.list_commands()
+    handler = handlers.get("sum")
+    check("命令已注册", handler is not None)
+    check("permission=admin（框架层声明）", getattr(handler, "permission", "") == "admin",
+          str(getattr(handler, "permission", "")))
+    check("scope=private（只在私聊响应）", getattr(handler, "scope", "") == "private",
+          str(getattr(handler, "scope", "")))
+    check("中文别名 /待办", "待办" in handlers)
+    check("英文别名 /td", "td" in handlers)
+
+    # ---- 托管群
+    reply = await _cmd(plugin, ["config", "add", str(GROUP)])
+    check("config add 回执", "已托管" in reply, reply[:60])
+    check("群号进了托管名单", plugin.is_watched(GROUP) is True)
+
+    # ---- 喂消息（真实入库；采集走群事件）
+    texts = ["明天下午五点前把开题报告交到教务系统，@张三 负责",
+             "收到", "还有周五下午三点在 302 开会，所有人必须到"]
+    for i, text in enumerate(texts, start=10):
+        await msg_event.record(plugin, _group_event(text, mid=i))
+    check("消息落库 3 条", store.message_count(GROUP) == 3,
+          f"实际 {store.message_count(GROUP)}")
+    await msg_event.record(plugin, _group_event(texts[0], mid=10))
+    check("重复 message_id 去重", store.message_count(GROUP) == 3)
+
+    # ---- 假模型
+    calls = []
+
+    async def fake_chat(p, messages, *, model=""):
+        calls.append(messages)
+        return json.dumps({"todos": [
+            {"title": "提交开题报告", "owner": "张三", "due": "2026-11-05 17:00",
+             "priority": "high", "evidence": "明天下午五点前交"},
+            {"title": "参加 302 会议", "owner": "", "due": "2026-11-06 15:00",
+             "priority": "normal", "evidence": "必须到"},
+        ]}, ensure_ascii=False)
+
+    original_chat = llm.chat
+    llm.chat = fake_chat
+    try:
+        # 只托管一个群 → 群号可省
+        reply = await _cmd(plugin, ["summary", "24h"])
+        check("单群时群号可省", "提交开题报告" in reply, reply[:120])
+        check("总结带截止时间", "截止 2026-11-05 17:00" in reply)
+        check("模型收到了群消息", calls and "开题报告" in calls[0][1]["content"])
+        check("待办入库 2 条", len(store.open_todos(GROUP)) == 2)
+
+        await _cmd(plugin, ["summary"])
+        check("重复总结不新增", len(store.open_todos(GROUP)) == 2,
+              f"实际 {len(store.open_todos(GROUP))}")
+
+        async def bad_chat(p, messages, *, model=""):
+            return "这段时间大概有三件事要做吧"
+        llm.chat = bad_chat
+        reply = await _cmd(plugin, ["summary"])
+        check("未结构化时给出原文提示", "没按格式输出" in reply, reply[:80])
+    finally:
+        llm.chat = original_chat
+
+    # ---- 冷却
+    cmd_main.COOLDOWN_SECONDS = 60
+    plugin._last_summary[GROUP] = int(time.time())
+    reply = await _cmd(plugin, ["summary"])
+    check("连点会被冷却拦住", "秒后再试" in reply, reply[:60])
+    cmd_main.COOLDOWN_SECONDS = 0
+
+    # ---- 列表 / 完成
+    reply = await _cmd(plugin, ["list"])
+    check("列表带编号", "#" in reply and "提交开题报告" in reply, reply[:120])
+    first = store.open_todos(GROUP)[-1]
+    reply = await _cmd(plugin, ["done", str(first["id"])])
+    check("done 标记完成", "已完成" in reply, reply[:60])
+    check("完成后不在 open 列表", len(store.open_todos(GROUP)) == 1)
+    reply = await _cmd(plugin, ["list", "all"])
+    check("list all 含已完成", "已完成" in reply, reply[:100])
+    reply = await _cmd(plugin, ["done", str(first["id"])])
+    check("重复完成有提示", "已经处理过" in reply)
+
+    # ---- 多群时要求带群号
+    await _cmd(plugin, ["config", "add", str(GROUP2)])
+    reply = await _cmd(plugin, ["summary"])
+    check("多群时提示带群号", "要指定群号" in reply, reply[:80])
+    llm.chat = fake_chat
+    try:
+        reply = await _cmd(plugin, ["summary", str(GROUP)])
+        check("带群号能跑", "提交开题报告" in reply or "没有采集到消息" in reply,
+              reply[:80])
+    finally:
+        llm.chat = original_chat
+
+    # ---- 配置
+    reply = await _cmd(plugin, ["config", "window", str(GROUP), "12h"])
+    check("config window", plugin.window_hours(GROUP) == 12, reply[:60])
+    reply = await _cmd(plugin, ["config", "time", "21:30"])
+    check("config time（单群默认？多群时提示）",
+          "21:30" in reply or "要指定群号" in reply, reply[:60])
+    reply = await _cmd(plugin, ["config", "add", str(GROUP2)])
+    check("重复加群有提示", "本来就在托管" in reply, reply[:60])
+
+    reply = await _cmd(plugin, ["status"])
+    check("status 有库路径", "数据库" in reply and "qqnotice_sum.db" in reply, reply[:200])
+    reply = await _cmd(plugin, [])
+    check("面板有用法", "/sum summary" in reply and "托管" in reply, reply[:120])
+    reply = await _cmd(plugin, ["config"])
+    check("config 总览", "/sum config" in reply and "add" in reply)
+
+    # ---- 补采（假接口）
+    base = int(time.time())
+    raw = [{"message_id": 5000 + i, "message_seq": 5000 + i,
+            "time": base - (45 - i) * 60,
+            "sender": {"user_id": 7, "nickname": "历史"},
+            "message": [{"type": "text", "data": {"text": f"历史消息 {i}"}}]}
+           for i in range(45)]
+    plugin.api = _FakeApi(raw)
+    before = store.message_count(GROUP)
+    saved = await history.backfill(plugin, GROUP, since_ts=base - 40 * 60,
+                                   max_pages=5, page_size=20)
+    check("补采只拿窗口内的（40 条）", saved == 40, f"实际 {saved}")
+    check("补采真的落库", store.message_count(GROUP) == before + 40,
+          f"实际 {store.message_count(GROUP)}")
+    saved_again = await history.backfill(plugin, GROUP, since_ts=base - 40 * 60,
+                                         max_pages=5, page_size=20)
+    check("重复补采不重复入库", saved_again == 0, f"实际 {saved_again}")
+    plugin.api = None
+
+    # ---- 取消托管
+    reply = await _cmd(plugin, ["config", "del", str(GROUP2)])
+    check("config del 生效", plugin.is_watched(GROUP2) is False, reply[:60])
+
+    timer.stop()
+
+
+def main() -> int:
+    test_spec()
+    test_window()
+    test_misc_parsers()
+    test_collect()
+    test_digest()
+    test_llm_parse()
+    try:
+        asyncio.run(test_end_to_end())
+    except Exception:                          # noqa: BLE001 - 测试脚本：打印后继续统计
+        traceback.print_exc()
+        check("端到端未抛异常", False)
+
+    print(f"\n{'=' * 46}")
+    print(f"通过 {len(_PASSED)} 项，失败 {len(_FAILED)} 项")
+    if _FAILED:
+        for name in _FAILED:
+            print(f"  ✗ {name}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

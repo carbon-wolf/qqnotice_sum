@@ -1,0 +1,3 @@
+# 本插件不引入新依赖：模型调用走 aiohttp（ncqqpy 框架已依赖 aiohttp>=3.9）。
+# 保留这个文件是为了让 `/plugin install` 的依赖检查有东西可读。
+aiohttp>=3.9

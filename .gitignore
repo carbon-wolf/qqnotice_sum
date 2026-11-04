@@ -1,0 +1,10 @@
+# 运行时数据（sqlite / 缓存），不进仓库
+data/
+tests/.test-tmp/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.DS_Store
