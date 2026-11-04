@@ -22,14 +22,21 @@ from __future__ import annotations
 
 import time
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from napcat.message import MessageChain
 from napcat.registry import command
 
-from .. import history, render, schemas, service, store
+from .. import history, llm, render, schemas, service, store
 
 #: 连按两次的冷却（秒）。一次总结要花 token，防手抖比防人更重要。
 COOLDOWN_SECONDS = 10
+
+#: 模型配置是**全局**的（不属于某个群），走单独分支，不参与群号解析。
+LLM_ITEMS = {"key", "api", "test"}
+
+#: `api clear` 恢复到这个地址
+DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 
 #: `config` 的二级动作（英文为主，中文是别名）
 CONFIG_ALIASES = {
@@ -42,6 +49,10 @@ CONFIG_ALIASES = {
     "mode": "mode", "模式": "mode", "产出": "mode",
     "switch": "switch", "enabled": "switch", "开关": "switch", "启用": "switch",
     "default": "default", "默认": "default",
+    "key": "key", "apikey": "key", "api-key": "key", "密钥": "key", "秘钥": "key",
+    "api": "api", "base": "api", "base_url": "api", "url": "api",
+    "地址": "api", "接口": "api",
+    "test": "test", "测": "test", "测试": "test", "verify": "test", "check": "test",
 }
 
 
@@ -240,6 +251,12 @@ async def _act_status(plugin, event, rest):
 # ------------------------------------------------------------------ 动作：配置
 
 async def _act_config(plugin, event, rest):
+    # 模型配置是全局的，先摘出来：`/sum config key sk-1234567890` 里那串
+    # 数字会被当成群号，走不到正确分支。
+    head = CONFIG_ALIASES.get(str(rest[0]).lower()) if rest else None
+    if head in LLM_ITEMS:
+        return _out(await _CONFIG_ACTIONS[head](plugin, event, None, rest[1:]))
+
     gid, _span, tokens = _target(plugin, event, rest, with_window=False)
     if gid is None:
         # 群号可能写在项后面：`/sum config window 987654321 12h`
@@ -252,7 +269,7 @@ async def _act_config(plugin, event, rest):
     key = CONFIG_ALIASES.get(tokens[0].lower())
     if key is None:
         return _out(f"不认识「{tokens[0]}」。可用：add / del / window / time / "
-                    "push / model / switch / default。")
+                    "push / model / mode / switch / default / key / api / test。")
     handler = _CONFIG_ACTIONS[key]
     return _out(await handler(plugin, event, gid, tokens[1:]))
 
@@ -403,6 +420,176 @@ async def _cfg_mode(plugin, event, gid, args):
     return f"✅ 本群默认产出改成 {mode}（{service.mode_label(mode)}）。"
 
 
+# ------------------------------------------------------------------ 配置：模型
+
+async def _cfg_key(plugin, event, gid, args):
+    """配置模型密钥（全局）。
+
+    只私聊能用（命令上已声明 `scope="private"`），且限超管 —— 这一条改动
+    影响所有群和账单，不该跟群的开关一个待遇。发完**立刻撤回**那条消息，
+    免得密钥以明文留在聊天记录里。
+    """
+    if not _is_superuser(plugin, event):
+        return "模型密钥只有超管能改。要给别人改，先 `/userperm set <QQ> superuser`。"
+
+    current = plugin.llm_cfg()["api_key"]
+    if not args:
+        if not current:
+            return ("还没配密钥。发：`/sum config key sk-xxxx`\n"
+                    "想一条写完：`/sum config key sk-xxxx https://api.deepseek.com/v1`")
+        return (f"当前密钥：{render.mask_key(current)}\n"
+                "换一个：`/sum config key sk-xxxx`　清空：`/sum config key clear`")
+
+    head = str(args[0]).strip().strip("\"'`")
+    if head.lower() in ("clear", "off", "none", "清空", "删除"):
+        plugin.update_llm(api_key="")
+        return "✅ 已清空密钥（总结会失败，补采和清单还能用）。"
+
+    # 顺手支持一条命令配两样：第一个词是 key，第二个词像地址就当 base_url
+    api = None
+    if len(args) >= 2:
+        api = _clean_base_url(args[1])
+        if api is None:
+            return ("第二段不像接口地址。要么只给密钥，要么写成 "
+                    "`/sum config key sk-xxxx https://api.deepseek.com/v1`。")
+
+    key = _clean_key(head)
+    if not key:
+        return ("这不像密钥。常见形态是 `sk-` 开头的一长串；"
+                "引号、`Bearer ` 前缀、前后空格会自动去掉。")
+
+    plugin.update_llm(api_key=key, base_url=api)
+    recalled = await _recall(plugin, event)
+    cfg = plugin.llm_cfg()
+    lines = [f"✅ 已保存密钥：{render.mask_key(key)}"]
+    if api:
+        lines.append(f"   接口同时设为 {api}")
+    lines.append(f"   模型 {cfg['model']}")
+    lines.append("")
+    lines.append("（含密钥的这条消息已撤回）" if recalled
+                 else "（没能自动撤回——机器人一般删不掉你的私聊消息，"
+                      "建议手动删掉这条带密钥的记录）")
+    lines.append("立即生效，不用 reload。验一下：`/sum config test`")
+    return "\n".join(lines)
+
+
+async def _cfg_api(plugin, event, gid, args):
+    """配置 OpenAI 兼容接口地址（全局）。"""
+    if not _is_superuser(plugin, event):
+        return "接口地址只有超管能改。"
+
+    current = plugin.llm_cfg()["base_url"]
+    if not args:
+        return (f"当前接口：{current}\n"
+                "改法：`/sum config api https://api.deepseek.com/v1`（clear = 恢复默认）\n"
+                "常见写法：\n"
+                "  DeepSeek   https://api.deepseek.com/v1\n"
+                "  通义千问   https://dashscope.aliyuncs.com/compatible-mode/v1\n"
+                "  本地 vLLM  http://127.0.0.1:8000/v1")
+
+    raw = str(args[0]).strip().strip("\"'`")
+    if raw.lower() in ("clear", "reset", "default", "默认", "恢复"):
+        plugin.update_llm(base_url=DEFAULT_BASE_URL)
+        return f"✅ 已恢复默认接口：{DEFAULT_BASE_URL}"
+
+    url = _clean_base_url(raw)
+    if url is None:
+        return ("这不像接口地址。要以 http:// 或 https:// 开头，并且是 OpenAI 兼容的 "
+                "`/v1` 路径，例如 `https://api.deepseek.com/v1`。")
+    plugin.update_llm(base_url=url)
+    return f"✅ 已保存接口：{url}\n立即生效。验一下：`/sum config test`"
+
+
+async def _cfg_test(plugin, event, gid, args):
+    """真发一次请求，确认 key / 接口 / 模型名能配合上。
+
+    比「保存成功」有用得多 —— 配错接口最常见的结果就是存住了但一次都调不通。
+    """
+    cfg = plugin.llm_cfg()
+    if not cfg["api_key"]:
+        return "还没配密钥：`/sum config key sk-xxxx`"
+    started = time.time()
+    try:
+        raw = await llm.chat(plugin, [{"role": "user", "content": "只回复两个字母：ok"}],
+                             model=cfg["model"])
+    except Exception as e:                     # noqa: BLE001 - 任何失败都要如实说
+        reason = getattr(e, "user_message", None) or str(e) or type(e).__name__
+        return (f"❌ 调不通\n接口：{cfg['base_url']}\n模型：{cfg['model']}\n原因：{reason}")
+    cost = int((time.time() - started) * 1000)
+    answer = (raw or "").strip().replace("\n", " ")[:60] or "（空回复）"
+    return (f"✅ 调通了（{cost} ms）\n接口：{cfg['base_url']}\n"
+            f"模型：{cfg['model']}\n回复：{answer}")
+
+
+def _is_superuser(plugin, event) -> bool:
+    """框架的超管判定；拿不到权限管理器（冒烟/离线）时不拦。"""
+    perm = getattr(plugin, "perm", None)
+    if perm is None:
+        return True
+    try:
+        return bool(perm.is_superuser(int(getattr(event, "user_id", 0) or 0)))
+    except (TypeError, ValueError):
+        return False
+
+
+async def _recall(plugin, event) -> bool:
+    """撤回那条带密钥的命令消息；拿不到 api / 没权限就静默失败。"""
+    api = getattr(plugin, "api", None)
+    message_id = getattr(event, "message_id", None)
+    if api is None or not message_id:
+        return False
+    try:
+        await api.delete_msg(int(message_id))
+        return True
+    except Exception:                          # noqa: BLE001 - 撤不掉不影响保存
+        return False
+
+
+def _clean_key(text: str) -> str:
+    """清掉粘贴时带上的引号、反引号、`Bearer ` 前缀和零宽字符。"""
+    key = str(text or "").strip().strip("\"'`，,。")
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    key = key.replace(" ", "").replace("\u200b", "").replace("\u3000", "")
+    if len(key) < 8:
+        return ""
+    # 真密钥都是可打印 ASCII。挡掉「我的key是xxx」这类误发 —— 否则它会被
+    # 当成密钥存下来，之后每次总结都拿它去撞接口，报的错还看不懂。
+    if any(ord(ch) < 33 or ord(ch) > 126 for ch in key):
+        return ""
+    return key[:200]
+
+
+def _clean_base_url(text: str) -> Optional[str]:
+    """接口地址规范化：补 scheme、去尾斜杠、挡掉明显不是 URL 的输入。
+
+    允许 `api.deepseek.com/v1` 这种省了 scheme 的写法 —— 粘贴时很常见。
+    """
+    raw = str(text or "").strip().strip("\"'`")
+    if not raw:
+        return None
+    if "://" not in raw:
+        host = raw.split("/")[0]
+        if "." not in host and not host.startswith(("localhost", "127.0.0.1")):
+            return None
+        raw = "https://" + raw
+
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        return None
+    host = parts.netloc.split(":")[0]
+    if "." not in host and not host.startswith(("localhost", "127.0.0.1")):
+        return None
+    try:
+        _port = parts.port                         # 读一次触发端口合法性校验
+    except ValueError:
+        return None
+    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+
+
 def _first_group_id(args) -> Optional[int]:
     for token in args:
         gid = schemas.parse_group_id(token)
@@ -450,4 +637,7 @@ _CONFIG_ACTIONS = {
     "model": _cfg_model,
     "switch": _cfg_switch,
     "default": _cfg_default,
+    "key": _cfg_key,
+    "api": _cfg_api,
+    "test": _cfg_test,
 }

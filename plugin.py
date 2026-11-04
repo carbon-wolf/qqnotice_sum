@@ -46,7 +46,7 @@ COMMAND_NAME = "sum"
 
 class QQNoticeSumPlugin(PluginBase):
     name = "qqnotice_sum"
-    version = "1.2.0"
+    version = "1.3.0"
     description = "通知群消息 → 待办：实时采集 + 历史补采，私聊查询 / 每日推送"
     author = "carbon-wolf"
 
@@ -321,6 +321,16 @@ class QQNoticeSumPlugin(PluginBase):
         defaults[key] = value
         self.config.set("defaults", defaults)
         return True
+
+    def update_llm(self, **changes) -> dict:
+        """改 `llm.*`（api_key / base_url / model …），立刻落盘。
+
+        `llm_cfg()` 每次现读 `self.config`，所以写完下一句命令就生效，不用 reload。
+        """
+        block = dict(self.config.get("llm") or {})
+        block.update({k: v for k, v in changes.items() if v is not None})
+        self.config.set("llm", block)
+        return block
 
     # ------------------------------------------------------------------ 连接就绪
 

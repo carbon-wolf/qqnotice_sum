@@ -39,7 +39,7 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
 /sum done    <编号>         标记完成
 /sum drop    <编号>         忽略（以后不再重复提醒）
 /sum sync    [24h]          强制从群历史补采一次
-/sum config  …              群配置（见下）
+/sum config  …              群配置 + 模型配置（见下）
 /sum status                 采集与模型状态
 ```
 
@@ -128,6 +128,32 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
 
 构建插件时会把全部配置项写进 `config.json → plugins.qqnotice_sum`（只补缺、不覆盖）。
 
+**但日常不用去改那个文件**：模型密钥和接口地址可以直接私聊配。
+
+```text
+/sum config key sk-xxxxxxxxxxxx              配密钥（发完自动撤回这条消息）
+/sum config key sk-xxxx https://.../v1       一条命令同时配密钥和接口
+/sum config key                              看当前密钥（脱敏成 sk-a…cdef）
+/sum config key clear                        清空
+/sum config api https://api.deepseek.com/v1  换接口
+/sum config api                              看当前接口 + 常见几家写法
+/sum config api clear                        恢复默认（DeepSeek）
+/sum config test                             真发一次请求，确认能调通
+```
+
+几个约束，都是刻意加的：
+
+* **只有超管能改**。这一项影响所有群和账单，不该跟「某群开关」一个待遇。
+  想放权：`/userperm set <QQ> superuser`。
+* **只有私聊能发**（`scope="private"`），且回复里**永远不回显完整密钥**，只显示 `sk-a…cdef（25 位）`。
+* 保存后**立刻生效**，不用 `/reload`。
+* 密钥明文落在 `config.json` 里 —— 这是框架的配置机制决定的，注意那个文件的权限
+  （别提交到 git，`.gitignore` 已经排除了 `config.json`）。
+* `/sum config test` 是配完必做的一步：接口填错最常见的结果是「存住了但一次都调不通」。
+  它会把 HTTP 状态、接口地址、模型名一起回给你。
+
+手动改 `config.json` 也行（适合批量部署），字段如下：
+
 ```json
 {
   "enabled": true,
@@ -178,7 +204,8 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
 
 * `llm.base_url` 用任意 OpenAI 兼容口（DeepSeek / 通义 / 自建 vLLM / Ollama），
   换家只改 `base_url` + `model`。要用图片就得选支持视觉的模型。
-* `api_key` 不填时总结会直接报「配置错误」，不会静默失败。
+* `api_key` 不填时总结会直接报「配置错误」，不会静默失败。用命令配更快：
+  `/sum config key sk-xxx`（见上一节）。
 * `clean.noise` 是整条丢弃的无信息量短句；`merge_seconds` 控制同一人连发多久内合并
   （合并时**附件会跟着并过来**，不会因为「先发文字后发图」而丢图）。
 * `max_context_chars` 是给模型的聊天记录上限，超了按时间均匀抽样。
@@ -222,7 +249,8 @@ Msg.objects.filter(group_id=..., ts__gte=...)              # napcat.store.Model
 报告里会写「格式需要额外依赖才能解析」。`pip install pypdf python-docx openpyxl` 即可。
 
 **报「配置错误：没配 llm.api_key」**
-填 `config.json` 的 `plugins.qqnotice_sum.llm.api_key`，然后 `/reload qqnotice_sum`。
+私聊发 `/sum config key sk-xxxx`（超管），然后 `/sum config test` 验一下。
+手动改也行：填 `config.json` 的 `plugins.qqnotice_sum.llm.api_key`，`/reload qqnotice_sum`。
 
 **群里发 `/sum` 没反应**
 正常 —— 本插件只认私聊。推送由定时任务完成，不需要在群里发命令。
@@ -236,7 +264,7 @@ Msg.objects.filter(group_id=..., ts__gte=...)              # napcat.store.Model
 ```bash
 cd /path/to/ncqqpy
 ./venv/Scripts/python.exe smoke_load.py                                   # 加载冒烟
-./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 118 项用例
+./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 153 项用例
 ```
 
 用例不连 QQ、不连网：端到端部分是真实插件实例 + 框架 sqlite，模型调用用假函数替换。

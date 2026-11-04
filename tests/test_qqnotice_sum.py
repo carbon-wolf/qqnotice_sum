@@ -35,8 +35,8 @@ from napcat.file_manager import FileManager                 # noqa: E402
 from napcat.models import MessageEvent, Sender              # noqa: E402
 from napcat.permission import PermissionManager             # noqa: E402
 
-from qqnotice_sum import (collect, digest, history, llm, media, schemas,   # noqa: E402
-                          store)
+from qqnotice_sum import (collect, digest, history, llm, media, render,   # noqa: E402
+                          schemas, store)
 from qqnotice_sum.commands import main as cmd_main                     # noqa: E402
 from qqnotice_sum.events import message as msg_event                   # noqa: E402
 from qqnotice_sum.plugin import QQNoticeSumPlugin                       # noqa: E402
@@ -276,6 +276,40 @@ def test_mode() -> None:
     check("乱写回落默认", schemas.parse_mode("xxx", "all") == "all")
     check("digest 动作", schemas.parse_spec(["digest", "24h"]) == ("digest", ["24h"]))
     check("todo 动作", schemas.parse_spec(["todo"]) == ("todo", []))
+
+
+def test_llm_config() -> None:
+    """密钥清洗 / 接口规范化 / 脱敏 —— 都是纯函数，不碰网络。"""
+    print("\n[模型配置]")
+    clean = cmd_main._clean_key
+    check("去引号", clean('"sk-1234567890"') == "sk-1234567890")
+    check("去 Bearer 前缀", clean("Bearer sk-1234567890") == "sk-1234567890")
+    check("去空格与零宽", clean(" sk-1234 567890\u200b ") == "sk-1234567890")
+    check("太短的拒收", clean("abc") == "")
+    check("空串拒收", clean("") == "")
+    check("中文注释不算", clean("我还没申请key") == "")
+
+    clean_url = cmd_main._clean_base_url
+    check("标准地址", clean_url("https://api.deepseek.com/v1") ==
+          "https://api.deepseek.com/v1")
+    check("省 scheme 补 https", clean_url("api.siliconflow.cn/v1") ==
+          "https://api.siliconflow.cn/v1")
+    check("去尾斜杠", clean_url("https://api.deepseek.com/v1/") ==
+          "https://api.deepseek.com/v1")
+    check("本地端口保留", clean_url("http://127.0.0.1:8000/v1") ==
+          "http://127.0.0.1:8000/v1")
+    check("localhost 也认", clean_url("localhost:11434/v1") ==
+          "https://localhost:11434/v1")
+    check("乱写拒收", clean_url("这不是地址") is None)
+    check("裸词拒收", clean_url("hello") is None)
+    check("ftp 拒收", clean_url("ftp://a.com/v1") is None)
+    check("端口越界拒收", clean_url("http://a.com:99999/v1") is None)
+
+    mask = render.mask_key
+    check("长 key 只留前四后四", mask("sk-abcdef1234567890") == "sk-a…7890（19 位）",
+          mask("sk-abcdef1234567890"))
+    check("短 key 打星", mask("sk-123456") == "sk" + "*" * 7, mask("sk-123456"))
+    check("空 key 空串", mask("") == "")
 
 
 def test_upgrade() -> None:
@@ -547,6 +581,80 @@ async def test_end_to_end() -> None:
     check("重复补采不重复入库", saved_again == 0, f"实际 {saved_again}")
     plugin.api = None
 
+    # ---- 模型配置（私聊 key / api）
+    class _RecallApi:
+        def __init__(self):
+            self.deleted = []
+
+        async def delete_msg(self, message_id):
+            self.deleted.append(int(message_id))
+
+    recall_api = _RecallApi()
+    plugin.api = recall_api
+
+    reply = await _cmd(plugin, ["config", "key", "sk-should-not-work"],
+                       _private_event(uid=MEMBER))
+    check("非超管配 key 被拒", "只有超管" in reply, reply[:60])
+    check("非超管没写进配置", not plugin.llm_cfg()["api_key"])
+
+    reply = await _cmd(plugin, ["config", "key"], _private_event(uid=SUPER))
+    check("没配时提示怎么配", "/sum config key" in reply, reply[:80])
+
+    secret = "sk-abcdef1234567890abcdef"
+    reply = await _cmd(plugin, ["config", "key", f'"{secret}"'], _private_event(uid=SUPER))
+    check("key 保存成功", plugin.llm_cfg()["api_key"] == secret, reply[:80])
+    check("回复里不回显完整 key", secret not in reply, reply[:120])
+    check("回复里是脱敏形态", "sk-a" in reply and "cdef（" in reply, reply[:80])
+    check("含 key 的消息被撤回", recall_api.deleted == [1], str(recall_api.deleted))
+
+    reply = await _cmd(plugin, ["config", "key"], _private_event(uid=SUPER))
+    check("无参显示脱敏 key", secret not in reply and "sk-a" in reply, reply[:80])
+
+    # 一条命令配两样：key + 接口
+    reply = await _cmd(plugin, ["config", "key", "sk-newkey0987654321",
+                                "api.siliconflow.cn/v1"], _private_event(uid=SUPER))
+    check("同时设了接口", plugin.llm_cfg()["base_url"] == "https://api.siliconflow.cn/v1",
+          plugin.llm_cfg()["base_url"])
+    check("省 scheme 也认", "https://" in reply, reply[:100])
+
+    reply = await _cmd(plugin, ["config", "api", "http://127.0.0.1:8000/v1/"],
+                       _private_event(uid=SUPER))
+    check("api 去尾斜杠", plugin.llm_cfg()["base_url"] == "http://127.0.0.1:8000/v1",
+          plugin.llm_cfg()["base_url"])
+    reply = await _cmd(plugin, ["config", "api", "这不是地址"], _private_event(uid=SUPER))
+    check("乱写的接口被拒", "不像接口地址" in reply, reply[:60])
+
+    reply = await _cmd(plugin, ["config", "api", "clear"], _private_event(uid=SUPER))
+    check("api clear 恢复默认", plugin.llm_cfg()["base_url"] == cmd_main.DEFAULT_BASE_URL,
+          plugin.llm_cfg()["base_url"])
+
+    # test 动作：成功与失败两条路
+    original_chat2 = llm.chat
+
+    async def ok_chat(p, messages, *, model=""):
+        return "ok"
+
+    async def boom_chat(p, messages, *, model=""):
+        from napcat.errors import PluginConfigError
+        raise PluginConfigError("bad key", user_message="模型密钥无效或没权限")
+
+    try:
+        llm.chat = ok_chat
+        reply = await _cmd(plugin, ["config", "test"], _private_event(uid=SUPER))
+        check("test 调通有耗时", "调通了" in reply and "ms" in reply, reply[:100])
+        llm.chat = boom_chat
+        reply = await _cmd(plugin, ["config", "test"], _private_event(uid=SUPER))
+        check("test 失败说原因", "调不通" in reply and "密钥无效" in reply, reply[:120])
+    finally:
+        llm.chat = original_chat2
+
+    reply = await _cmd(plugin, ["config", "key", "clear"], _private_event(uid=SUPER))
+    check("key clear 清空", plugin.llm_cfg()["api_key"] == "", reply[:60])
+    reply = await _cmd(plugin, ["config", "test"], _private_event(uid=SUPER))
+    check("没 key 时 test 提示先配", "还没配密钥" in reply, reply[:60])
+
+    plugin.api = None
+
     # ---- 取消托管
     reply = await _cmd(plugin, ["config", "del", str(GROUP2)])
     check("config del 生效", plugin.is_watched(GROUP2) is False, reply[:60])
@@ -565,6 +673,7 @@ def main() -> int:
     asyncio.run(test_media_limits())
     test_report_parse()
     test_mode()
+    test_llm_config()
     test_upgrade()
     try:
         asyncio.run(test_end_to_end())

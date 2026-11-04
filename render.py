@@ -260,6 +260,20 @@ def closed_ack(todo: dict, status: str) -> str:
 
 # ------------------------------------------------------------------ 设置
 
+def mask_key(key: str) -> str:
+    """密钥脱敏：只留前 4 后 4。
+
+    回复里**永远**不回显完整密钥 —— 聊天记录会被别人翻到，也会被截图。
+    短到没法遮的干脆只留前两位。
+    """
+    text = str(key or "").strip()
+    if not text:
+        return ""
+    if len(text) <= 10:
+        return text[:2] + "*" * max(1, len(text) - 2)
+    return f"{text[:4]}…{text[-4:]}（{len(text)} 位）"
+
+
 def config_overview(plugin) -> str:
     """不带群号时的配置总览。"""
     defaults = plugin.defaults()
@@ -277,6 +291,11 @@ def config_overview(plugin) -> str:
         "  mode all|digest|todo  该群默认产出（摘要 / 待办 / 都要）",
         "  switch on|off         该群是否继续采集",
         "  default …             改全局默认（仅超管）",
+        "",
+        "模型（全局，仅超管 · 私聊里发，改完立即生效）",
+        "  key <sk-…>            配置 API Key（发完自动撤回这条消息）",
+        "  api <base_url>        配置接口地址（clear = 恢复默认）",
+        "  test                  试调一次模型，确认 key 与接口可用",
         "",
         f"全局默认：window {defaults['window_hours']}h · "
         f"push {defaults['push_time'] or '关'} · max {defaults['max_todos']} 条",
@@ -321,8 +340,9 @@ def status(plugin) -> str:
     now = int(time.time())
     lines = ["🩺 qqnotice_sum 状态", ""]
     lines.append(f"  版本：v{plugin.version}　托管群：{len(gids)} 个")
-    lines.append(f"  模型：{cfg['model']} @ {cfg['base_url']}"
-                 + ("" if cfg["api_key"] else "（⚠️ 没配 api_key）"))
+    lines.append(f"  模型：{cfg['model']} @ {cfg['base_url']}")
+    lines.append("  密钥：" + (mask_key(cfg["api_key"]) if cfg["api_key"]
+                               else "⚠️ 没配 —— 发 `/sum config key sk-…`"))
     lines.append(f"  数据库：{_db_hint(plugin)}")
     lines.append("")
     if not gids:
