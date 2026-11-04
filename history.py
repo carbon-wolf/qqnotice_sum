@@ -31,16 +31,8 @@ def _int(value, default: int = 0) -> int:
         return default
 
 
-async def fetch_page(api, group_id, *, cursor: Optional[int] = None,
-                     count: int = 40) -> list[dict]:
-    """取一页历史（新 → 旧）。接口返回形态两种都认：`{"messages": [...]}` 或裸列表。"""
-    try:
-        data = await api.get_group_msg_history(
-            str(group_id), count=int(count),
-            message_seq=int(cursor) if cursor else None,
-            reverse_order=True)
-    except Exception as e:                    # noqa: BLE001 - 上游任何失败都只影响这次补采
-        raise RuntimeError(f"拉取群 {group_id} 历史消息失败：{e}") from e
+def _batch_of(data) -> list[dict]:
+    """接口返回形态三种都认：`{"messages": [...]}` / `{"data": [...]}` / 裸列表。"""
     if isinstance(data, dict):
         batch = data.get("messages") or data.get("data") or []
     elif isinstance(data, list):
@@ -48,6 +40,35 @@ async def fetch_page(api, group_id, *, cursor: Optional[int] = None,
     else:
         batch = []
     return [m for m in batch if isinstance(m, dict) and m.get("message_id")]
+
+
+async def fetch_page(api, group_id, *, cursor: Optional[int] = None,
+                     count: int = 40) -> list[dict]:
+    """取一页历史（新 → 旧）。
+
+    **`message_seq` 的坑**：不传时框架会把这个参数整个省略，但有些 NapCat
+    版本不认「省略」，会拿 `undefined` 去查消息，直接回
+    `[1200] 消息undefined不存在`。所以第一页走两段式：先按省略调，报错了
+    再显式给 `message_seq=0`（多数实现里 0 就是「从最新开始」）。
+
+    翻页时游标是确定的，没有这个歧义。
+    """
+    attempts: list[Optional[int]] = [int(cursor)] if cursor else [None, 0]
+    last_error: Optional[BaseException] = None
+    for seq in attempts:
+        extra = {"message_seq": seq} if seq is not None else {}
+        try:
+            data = await api.get_group_msg_history(
+                str(group_id), count=int(count),
+                reverse_order=True, **extra)
+        except Exception as e:                # noqa: BLE001 - 换一种传法再试
+            last_error = e
+            continue
+        return _batch_of(data)
+
+    raise RuntimeError(
+        f"拉取群 {group_id} 历史消息失败（不传 message_seq 与传 0 都试过）："
+        f"{last_error}") from last_error
 
 
 async def backfill(plugin, group_id, *, since_ts: int, max_pages: Optional[int] = None,
@@ -63,12 +84,14 @@ async def backfill(plugin, group_id, *, since_ts: int, max_pages: Optional[int] 
     if api is None:
         return 0
     cfg = plugin.history_cfg()
-    max_pages = int(max_pages or cfg["max_pages"])
+    max_pages = int(cfg["max_pages"] if max_pages is None else max_pages)
+    if max_pages <= 0:
+        return 0                          # 配置里关掉了历史补采
     page_size = int(page_size or cfg["page_size"])
 
     rows: list[dict] = []
     cursor: Optional[int] = None
-    for _page in range(max(1, max_pages)):
+    for _page in range(max_pages):
         batch = await fetch_page(api, group_id, cursor=cursor, count=page_size)
         if not batch:
             break

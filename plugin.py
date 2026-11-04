@@ -48,7 +48,7 @@ COMMAND_NAME = "sum"
 
 class QQNoticeSumPlugin(PluginBase):
     name = "qqnotice_sum"
-    version = "1.5.0"
+    version = "1.6.0"
     description = "通知群消息 → 摘要 / 待办 / 随时提问：实时采集 + 历史补采，私聊可用，每日推送"
     author = "carbon-wolf"
 
@@ -298,7 +298,9 @@ class QQNoticeSumPlugin(PluginBase):
         block = raw if isinstance(raw, dict) else {}
         return {
             "bootstrap_hours": _positive_int(block.get("bootstrap_hours"), 24),
-            "max_pages": _positive_int(block.get("max_pages"), 10),
+            # 0 = 完全不做历史补采（只靠实时采集）。给那些
+            # `get_group_msg_history` 不可用的部署留一条退路。
+            "max_pages": _positive_int(block.get("max_pages"), 10, minimum=0),
             "page_size": _positive_int(block.get("page_size"), 40),
         }
 

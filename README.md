@@ -161,18 +161,29 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
 
 通知群的干货经常在截图和附件里，所以：
 
-**取字节走框架的接口**，不是自己 HTTP 拉：
+**取字节走框架的接口**，不是自己 HTTP 拉。按文档的三层入口，能探测到哪层用哪层：
 
 ```python
-api.download_file_image_stream(file=..., file_id=...)   # 图片
-api.download_file_stream(file=url, file_id=...)          # 文件
+self.files.download_image_stream(file=..., file_id=...)   # 图片（§11.1 标准入口）
+self.files.download_stream(url, file_id=...)              # 文件
+self.api.download_file_image_stream(...)                  # 低层，等价（§11.3）
+self.api.download_file(url=...)                           # 更老的框架只有这个
 ```
 
-这是让 NapCat 那边去下载再分块传回来 —— 它就在 QQ 环境里，能拿到我们拿不到的东西。
+这是让 NapCat 那边去下载再传回来 —— 它就在 QQ 环境里，能拿到我们拿不到的东西。
 自己拉 URL 基本行不通：图片链带防盗链（403）、群文件链要 cookie（401）、
-消息段里的 `file` 常常是 `file://` 本地路径。**这是最初版本图片/文件全挂的根因**，
-1.5.0 修掉了。群文件还会先用 `get_group_file_url` 换成带鉴权的直链再下。
-流式读的途中就计数，超限立刻掐断，不会先把 200MB 读进内存再判断。
+消息段里的 `file` 常常是 `file://` 本地路径。
+
+三级降级，谁都可能踩空，所以都留着：
+
+| 顺序 | 方式 | 说明 |
+|---|---|---|
+| 1 | 流式（`self.files` → `self.api`） | 不落盘、超限能立刻掐断 |
+| 2 | `api.download_file(url=...)` | 老框架也有；下到 NapCat 那台机器后读回来 |
+| 3 | 直连 URL | 公网 CDN 图片偶尔能成 |
+
+群文件会先用 `get_group_file_url` 换成带鉴权的直链再交给上面三层。
+流式读的途中就计数，超限立刻 `aclose()`，不会先把 200MB 读进内存再判断。
 
 * **图片**以 multimodal 方式直接发给模型（`image_url` + base64），聊天记录里会标成
   `[图1]`、`[图2]`，与附带的图片顺序一一对应；
@@ -355,10 +366,26 @@ Msg.objects.filter(group_id=..., ts__gte=...)              # napcat.store.Model
 另外单张超过 `image.max_bytes` 的会被直接跳过。
 
 **图片 / 文件取不到**
-报告末尾会写具体原因（「超过单张上限」「取回来是空的」「napcat 超时」之类），
-先看那条。常见两类：一是 `media.image.max_bytes` / `file.max_bytes` 太小，
-二是框架与 NapCat 的连接断了 —— 附件是让 NapCat 去取的，连接不通就都取不到。
-确认 `config.json` 里 `media.enabled` 没被关掉。
+报告末尾会写清是哪几级失败了，例如：
+
+```
+文件1（流式：当前框架版本没有流式下载接口；download_file：没给回内容；
+      直连：直连被拒（HTTP 403，多半是防盗链））
+```
+
+按那条对：
+- 只有「流式」失败 → 走的是老框架，第 2 级应该能接上；两级都失败说明
+  框架与 NapCat **不在同一台机器**且没有流式接口 —— 这种部署确实取不到附件。
+- 全部失败 → 先看 `media.image.max_bytes` / `file.max_bytes` 是不是太小，
+  再确认框架与 NapCat 的连接没断（附件是让 NapCat 去取的）。
+- `media.enabled` 被关掉时不会有任何提示，直接跳过。
+
+**补采失败：`[1200] 消息undefined不存在`**
+有些 NapCat 版本不认「省略 `message_seq`」这种传法，会拿 `undefined` 去查消息。
+1.6.0 起会自动重试（改传 `message_seq=0`），不用管。如果两种都失败，
+错误里会写「不传 message_seq 与传 0 都试过」。
+实在用不了就把 `history.max_pages` 设成 `0`：跳过历史补采，只靠实时采集
+（从装插件那一刻起积累）。
 
 **PDF / Word 解析不了**
 报告里会写「格式需要额外依赖才能解析」。`pip install pypdf python-docx openpyxl` 即可。
@@ -379,7 +406,7 @@ Msg.objects.filter(group_id=..., ts__gte=...)              # napcat.store.Model
 ```bash
 cd /path/to/ncqqpy
 ./venv/Scripts/python.exe smoke_load.py                                   # 加载冒烟
-./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 200 项用例
+./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 210 项用例
 ```
 
 用例不连 QQ、不连网：端到端部分是真实插件实例 + 框架 sqlite，模型调用用假函数替换。

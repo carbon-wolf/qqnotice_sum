@@ -291,7 +291,11 @@ async def _act_sync(plugin, event, rest):
     try:
         saved = await history.backfill(plugin, gid, since_ts=start_ts)
     except Exception as e:                 # noqa: BLE001 - 上游错误原样告诉管理员
-        return _out(f"❌ 补采失败：{e}")
+        return _out(
+            f"❌ 补采失败：{e}\n\n"
+            "已入库的消息和待办不受影响；实时采集照常工作，只是翻不到更早的记录。\n"
+            "如果一直这样，多半是这个 NapCat 版本的 `get_group_msg_history` 用不了 —— "
+            "把 `config.json` 里 `history.max_pages` 设成 0 可以跳过补采。")
     total = store.message_count(gid)
     return _out(f"✅ 补采完成：新入库 {saved} 条（窗口 {render.span_text(start_ts, end_ts)}）。\n"
                 f"本群累计 {total} 条。现在可以 `/sum summary` 了。")

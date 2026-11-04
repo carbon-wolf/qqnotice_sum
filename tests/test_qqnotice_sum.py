@@ -512,6 +512,133 @@ async def test_media_api() -> None:
           and any("超过大小上限" in note for note in out["notes"]), str(out["notes"]))
 
 
+async def test_history_seq() -> None:
+    """有些 NapCat 不认「省略 message_seq」，要能自动换一种传法。"""
+    print("\n[历史补采 message_seq]")
+
+    class StrictApi:
+        """没传 message_seq 就报 1200，模拟严格版本。"""
+        def __init__(self):
+            self.calls = []
+
+        async def get_group_msg_history(self, group_id, *, count=20,
+                                        message_seq=None, reverse_order=False):
+            self.calls.append(message_seq)
+            if message_seq is None:
+                raise RuntimeError("[1200] 消息undefined不存在")
+            return {"messages": [
+                {"message_id": 1, "message_seq": 1, "time": int(time.time()),
+                 "sender": {"user_id": 1, "nickname": "a"},
+                 "message": [{"type": "text", "data": {"text": "hi"}}]}]}
+
+    api = StrictApi()
+    batch = await history.fetch_page(api, 123, count=10)
+    check("省略失败后改传 0", api.calls == [None, 0], str(api.calls))
+    check("重试后拿到了消息", len(batch) == 1, str(len(batch)))
+
+    class LenientApi:
+        def __init__(self):
+            self.calls = []
+
+        async def get_group_msg_history(self, group_id, *, count=20,
+                                        message_seq=None, reverse_order=False):
+            self.calls.append(message_seq)
+            return {"messages": []}
+
+    api2 = LenientApi()
+    await history.fetch_page(api2, 123, count=10)
+    check("正常版本只调一次", api2.calls == [None], str(api2.calls))
+
+    class CursorApi(LenientApi):
+        pass
+
+    api3 = CursorApi()
+    await history.fetch_page(api3, 123, cursor=555)
+    check("有游标就直接用（不试 0）", api3.calls == [555], str(api3.calls))
+
+    class DeadApi:
+        async def get_group_msg_history(self, **kw):
+            raise RuntimeError("不支持这个接口")
+
+    try:
+        await history.fetch_page(DeadApi(), 123)
+        check("彻底失败会抛错", False, "没抛异常")
+    except RuntimeError as e:
+        check("彻底失败会抛错并把原因带出来", "历史消息失败" in str(e), str(e)[:80])
+
+
+async def test_media_fallback() -> None:
+    """没有流式接口的部署也要能取到附件（三级降级）。"""
+    print("\n[附件降级]")
+    cfg = {"enabled": True, "timeout": 3, "cache_hours": 0,
+           "image": {"enabled": True, "max_bytes": 1024 * 1024, "max_per_run": 2},
+           "file": {"enabled": True, "max_bytes": 1024 * 1024, "max_per_run": 2,
+                    "max_chars": 200, "allow_ext": [".txt"]}}
+
+    image_item = {"kind": "image", "label": "图1", "index": 0,
+                  "descriptor": {"file": "a.jpg", "file_id": "img-1"},
+                  "row": {"message_id": 1}}
+    file_item = {"kind": "file", "label": "文件1", "index": 0,
+                 "descriptor": {"name": "名单.txt", "file_id": "f-1"},
+                 "row": {"message_id": 2}}
+
+    # 1) 只有 FileManager（文档 §11.1 的标准入口），api 没有流式方法
+    class Files:
+        async def download_image_stream(self, *, file=None, file_id=None):
+            yield b"\x89PNG\r\n\x1a\n" + b"x"
+
+        async def download_stream(self, url, *, file_id=None, timeout=60.0):
+            yield "FileManager 给的".encode()
+
+    class Api:
+        async def get_image(self, file=None, file_id=None):
+            return {"url": "http://127.0.0.1:1/none"}
+
+        async def get_group_file_url(self, group_id, file_id):
+            return {"url": "http://127.0.0.1:1/none"}
+
+    class P:
+        api = Api()
+        files = Files()
+
+    out = await media.gather(P(), 1, [image_item, file_item], cfg=cfg)
+    check("只认 self.files 时也能取图", bool(out["images"]), str(out["notes"]))
+    check("只认 self.files 时也能取文件",
+          bool(out["files"]) and "FileManager" in out["files"][0]["text"],
+          str(out["files"])[:100])
+
+    # 2) 老框架：只有 download_file，返回本地路径
+    tmpfile = Path(tempfile.mkdtemp(prefix="qqnotice-dl-")) / "a.txt"
+    tmpfile.write_text("老接口给的", encoding="utf-8")
+
+    class OldApi:
+        async def get_group_file_url(self, group_id, file_id):
+            return {"url": "http://127.0.0.1:1/x"}
+
+        async def download_file(self, *, url=None, name="file"):
+            return {"file": str(tmpfile)}
+
+    class P2:
+        api = OldApi()
+        files = None
+
+    out = await media.gather(P2(), 1, [file_item], cfg=cfg)
+    check("老框架靠 download_file 兜住",
+          bool(out["files"]) and "老接口给的" in out["files"][0]["text"],
+          str(out)[:120])
+
+    # 3) 什么都没有：原因要说清是哪几级都失败
+    class Nothing:
+        api = None
+        files = None
+
+    out = await media.gather(Nothing(), 1, [image_item], cfg=cfg)
+    note = " ".join(out["notes"])
+    check("全失败时说明各级原因", "流式" in note, note[:120])
+    check("不再报「版本不支持」这种误导说法",
+          "框架版本不支持流式下载" not in note, note[:120])
+
+
 def test_upgrade() -> None:
     """老库（1.1.0 没有 media/points 列）能不能原地升级。"""
     print("\n[老库升级]")
@@ -930,6 +1057,8 @@ def main() -> int:
     test_qa()
     test_incremental()
     asyncio.run(test_media_api())
+    asyncio.run(test_history_seq())
+    asyncio.run(test_media_fallback())
     test_upgrade()
     try:
         asyncio.run(test_end_to_end())

@@ -25,6 +25,7 @@ import hashlib
 import io
 import re
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 import aiohttp
@@ -120,7 +121,7 @@ async def _fetch(url: str, *, max_bytes: int, timeout: float) -> tuple[Optional[
     """直连下载，超过 `max_bytes` 立即放弃。
 
     **只当兜底用**：QQ 的图片链带防盗链、群文件链要 cookie，直连经常 401/403；
-    `file://` 路径更是拉不到。真正干活的是 `_read_via_api`。
+    `file://` 路径更是拉不到。真正干活的是 `_read_via_stream`。
     """
     if not url:
         return None, "没有可用的下载地址"
@@ -165,46 +166,74 @@ async def _drain(stream, max_bytes: int) -> Optional[bytes]:
     return bytes(buf)
 
 
-async def _read_via_api(api, descriptor: dict, *, kind: str,
-                        max_bytes: int, timeout: float) -> tuple[Optional[bytes], str]:
-    """让框架（NapCat 那边）去取字节。
+def _stream_candidates(plugin, descriptor: dict, *, kind: str):
+    """列出「流式读」的候选调用，按可靠性排序。
 
-    `download_file_image_stream` / `download_file_stream` 是走 WS 让 NapCat 自己
-    下载再分块传回来的 —— 它就在 QQ 环境里，能拿到我们直连拿不到的东西。
-    这也是**唯一**能处理 `file://` 路径和防盗链图片的方式。
+    文档 §11.1 的标准入口是 `self.files`（FileManager），§11.3 也说低层的
+    `self.api.download_file_*` 可以直接用。但**不是每个部署版本两个都在** ——
+    所以都探测一遍，谁在使用谁；一个都没有就返回空，上层降级到 `download_file`。
     """
-    method = ("download_file_image_stream" if kind == "image"
-              else "download_file_stream")
-    download = getattr(api, method, None)
-    if download is None:
-        return None, "框架版本不支持流式下载"
+    api = getattr(plugin, "api", None)
+    files = getattr(plugin, "files", None) or getattr(plugin, "file_manager", None)
 
-    # 按可靠性排序：图片认 file_id / file；文件认 url 与 file_id
-    candidates: list[dict] = []
-    file_id = str(descriptor.get("file_id") or "").strip()
-    file_ref = str(descriptor.get("file") or "").strip()
-    url = str(descriptor.get("url") or "").strip()
-    if kind == "image":
-        if file_id:
-            candidates.append({"file_id": file_id})
-        if file_ref:
-            candidates.append({"file": file_ref})
-        if url:
-            candidates.append({"file": url})
-    else:
-        if url:
-            candidates.append({"file": url})
-        if file_id:
-            candidates.append({"file_id": file_id})
-        if file_ref:
-            candidates.append({"file": file_ref})
+    file_id = str(descriptor.get("file_id") or "").strip() or None
+    file_ref = str(descriptor.get("file") or "").strip() or None
+    url = str(descriptor.get("url") or "").strip() or None
+
+    # 按「谁最可能认这个标识」排：图片认 file_id/file，文件认直链
+    raw = ([{"file_id": file_id}, {"file": file_ref}, {"file": url}]
+           if kind == "image" else
+           [{"file": url}, {"file_id": file_id}, {"file": file_ref}])
+    targets = [item for item in raw if any(item.values())]
+
+    out: list[tuple] = []
+    for kwargs in targets:
+        if api is not None:
+            name = ("download_file_image_stream" if kind == "image"
+                    else "download_file_stream")
+            fn = getattr(api, name, None)
+            if fn is not None:
+                out.append(("api", fn, kwargs))
+        if files is not None:
+            if kind == "image":
+                fn = getattr(files, "download_image_stream", None)
+                if fn is not None:
+                    out.append(("kw", fn, kwargs))
+            else:
+                # `FileManager.download_stream(url, *, file_id=...)` 第一个是位置参数
+                fn = getattr(files, "download_stream", None)
+                if fn is not None:
+                    out.append(("url", fn, kwargs))
+    return out
+
+
+def _call_stream(mode: str, fn, kwargs: dict, timeout: float):
+    """三种入口的签名不一样，这里抹平。返回异步字节迭代器。"""
+    if mode == "api":
+        return fn(timeout=float(timeout), **kwargs)
+    if mode == "url":                      # FileManager.download_stream(url, *, file_id)
+        target = kwargs.get("file")
+        rest = {k: v for k, v in kwargs.items() if k != "file"}
+        return fn(target, timeout=float(timeout), **rest)
+    return fn(**kwargs)                    # FileManager.download_image_stream(*, file, file_id)
+
+
+async def _read_via_stream(plugin, descriptor: dict, *, kind: str,
+                           max_bytes: int, timeout: float) -> tuple[Optional[bytes], str]:
+    """流式读：让 NapCat 那边边下边回传，我们这头边收边计数。
+
+    这是**首选**：不落盘、超限能立刻掐断，而且能处理 `file://` 路径和
+    带防盗链的图片链（我们直连拿不到）。
+    """
+    entries = _stream_candidates(plugin, descriptor, kind=kind)
+    if not entries:
+        return None, "当前框架版本没有流式下载接口"
 
     last = "没有可用的文件标识"
-    for kwargs in candidates:
+    for mode, fn, kwargs in entries:
         try:
-            blob = await _drain(download(timeout=float(timeout), **kwargs),
-                                max_bytes)
-        except Exception as e:              # noqa: BLE001 - 换下一个标识再试
+            blob = await _drain(_call_stream(mode, fn, kwargs, timeout), max_bytes)
+        except Exception as e:              # noqa: BLE001 - 换下一个入口/标识再试
             last = f"{type(e).__name__}: {str(e)[:80]}"
             continue
         if blob is None:
@@ -216,35 +245,101 @@ async def _read_via_api(api, descriptor: dict, *, kind: str,
     return None, last
 
 
+async def _read_via_download_file(api, url: str, *, max_bytes: int,
+                                  name: str = "") -> tuple[Optional[bytes], str]:
+    """老框架的兜底：`download_file`。
+
+    这是 NapCat 很早就有的接口，比流式下载普及得多。它把文件下到 **NapCat
+    那台机器**上，返回 `file` 路径（同机部署时能直接读）。没有流式接口的部署
+    靠这条活着。
+    """
+    if not url:
+        return None, "没有可用的下载地址"
+    download = getattr(api, "download_file", None)
+    if download is None:
+        return None, "框架没有 download_file"
+
+    try:
+        info = await download(url=url, name=name or "file")
+    except Exception as e:                 # noqa: BLE001
+        return None, f"download_file 失败（{type(e).__name__}: {str(e)[:60]}）"
+
+    def _get(key):
+        if isinstance(info, dict):
+            return info.get(key)
+        return getattr(info, key, None)
+
+    encoded = _get("base64")
+    if encoded:
+        try:
+            blob = base64.b64decode(encoded)
+        except Exception:                  # noqa: BLE001
+            blob = b""
+        if blob:
+            if max_bytes and len(blob) > max_bytes:
+                return None, "超过大小上限"
+            return blob, "ok"
+
+    path = _get("file")
+    if path:
+        try:
+            target = Path(str(path))
+            if target.is_file():
+                if max_bytes and target.stat().st_size > max_bytes:
+                    return None, "超过大小上限"
+                return target.read_bytes(), "ok"
+        except OSError:
+            pass
+    return None, "download_file 没给回内容（可能框架与 NapCat 不在同一台机器）"
+
+
 async def _read_media(plugin, group_id, descriptor: dict, *, kind: str,
                       max_bytes: int, timeout: float) -> tuple[Optional[bytes], str]:
-    """取附件字节：**先走框架 API**，拿不到才直连兜底。"""
+    """取附件字节，三级降级。
+
+    1. **流式**（`self.files` / `self.api.download_file_*`）—— 首选；
+    2. **`download_file`** —— 老框架也有的接口，靠它兜住没流式的部署；
+    3. **直连 URL** —— 最后的兜底，公网 CDN 图片偶尔能成。
+
+    为什么不自己 HTTP 拉：QQ 的图片链带防盗链（403）、群文件链要 cookie（401）、
+    消息段里的 `file` 常常是 `file://` 本地路径。这三样 aiohttp 一个都搞不定。
+    """
     target = dict(descriptor)
-    if kind == "file" and not str(target.get("url") or "").strip():
-        # 群文件得先换成 http 直链 —— `download_file` 认的是 url，不认群文件的
-        # busid/file_id。这个接口换出来的链自带鉴权参数。
-        got = await _file_url(plugin, group_id, descriptor)
+    if not str(target.get("url") or "").strip():
+        # 先把 url 换出来：文件走 get_group_file_url（带鉴权参数），
+        # 图片走 get_image。第 2、3 级都靠它。
+        got = (await _image_url(plugin, descriptor) if kind == "image"
+               else await _file_url(plugin, group_id, descriptor))
         if got:
             target["url"] = got
 
-    api = getattr(plugin, "api", None)
-    reason = "没有 API 连接"
-    if api is not None:
-        blob, reason = await _read_via_api(api, target, kind=kind,
-                                          max_bytes=max_bytes, timeout=timeout)
-        if blob:
-            return blob, "ok"
+    reasons: list[str] = []
 
-    # 兜底：公网 CDN 图片有时能直接下
-    url = str(target.get("url") or "").strip()
-    if not url and kind == "image":
-        url = await _image_url(plugin, descriptor)
-    if not url:
-        return None, reason
-    blob, direct = await _fetch(url, max_bytes=max_bytes, timeout=timeout)
+    blob, reason = await _read_via_stream(plugin, target, kind=kind,
+                                          max_bytes=max_bytes, timeout=timeout)
     if blob:
         return blob, "ok"
-    return None, f"{reason}；直连也不行：{direct}"
+    reasons.append(f"流式：{reason}")
+
+    api = getattr(plugin, "api", None)
+    url = str(target.get("url") or "").strip()
+    if api is not None and url:
+        name = str(descriptor.get("name") or "").strip()
+        blob, reason = await _read_via_download_file(api, url,
+                                                    max_bytes=max_bytes, name=name)
+        if blob:
+            return blob, "ok"
+        reasons.append(f"download_file：{reason}")
+
+    if url:
+        blob, reason = await _fetch(url, max_bytes=max_bytes, timeout=timeout)
+        if blob:
+            return blob, "ok"
+        reasons.append(f"直连：{reason}")
+    else:
+        reasons.append("没有可用的下载地址")
+
+    return None, "；".join(reasons)
 
 
 async def _image_url(plugin, descriptor: dict) -> str:
