@@ -35,7 +35,7 @@ from napcat.file_manager import FileManager                 # noqa: E402
 from napcat.models import MessageEvent, Sender              # noqa: E402
 from napcat.permission import PermissionManager             # noqa: E402
 
-from qqnotice_sum import (collect, digest, history, llm, media, render,   # noqa: E402
+from qqnotice_sum import (collect, digest, history, llm, media, qa, render,  # noqa: E402
                           schemas, store)
 from qqnotice_sum.commands import main as cmd_main                     # noqa: E402
 from qqnotice_sum.events import message as msg_event                   # noqa: E402
@@ -312,6 +312,60 @@ def test_llm_config() -> None:
     check("空 key 空串", mask("") == "")
 
 
+def test_qa() -> None:
+    """问答的检索与解析 —— 重点验证「放不下时不会把答案抽掉」。"""
+    print("\n[问答]")
+    now = 1_800_000_000
+    span = qa.detect_span("这周有什么要交的", now=now)
+    check("问题里的「这周」→ 周窗口", span is not None and span[1] == now, str(span))
+    span = qa.detect_span("最近3天谁请假了", now=now)
+    check("「最近3天」→ 72 小时", span is not None and span[1] - span[0] == 3 * 86400,
+          str(span))
+    span = qa.detect_span("昨天开会说了什么", now=now)
+    check("「昨天」→ 昨天整段", span is not None and span[1] - span[0] == 86400)
+    check("没提时间返回 None", qa.detect_span("谁负责收表", now=now) is None)
+
+    check("二元组切分", qa.grams("开题报告") == {"开题", "题报", "报告"},
+          str(qa.grams("开题报告")))
+    qgrams = qa.question_grams("开题报告什么时候交")
+    check("疑问词不参与打分", "什么" not in qgrams and "开题" in qgrams, str(qgrams))
+
+    base = now
+    rows = [{"message_id": i, "sender": f"用户{i % 5}",
+             "text": f"闲聊第{i}条，随便说两句天气和食堂", "ts": base + i, "media": []}
+            for i in range(300)]
+    rows.append({"message_id": 999, "sender": "学习委员",
+                 "text": "开题报告下周一前交到教务系统", "ts": base + 301, "media": []})
+    cfg = {"noise": [], "min_len": 1, "merge_seconds": 0, "max_msg_chars": 500}
+
+    picked = qa.select(rows, "开题报告什么时候交", clean_cfg=cfg, max_chars=2000)
+    check("放不下就筛", picked["trimmed"] is True and picked["picked"] < picked["total"],
+          f"{picked['picked']}/{picked['total']}")
+    check("答案那条被留下（不是均匀抽稀）",
+          any("开题报告" in item["text"] for item in picked["items"]),
+          str([item["text"][:16] for item in picked["items"]][:3]))
+    check("筛完仍按时间排",
+          [int(i["ts"]) for i in picked["items"]] ==
+          sorted(int(i["ts"]) for i in picked["items"]))
+
+    small = qa.select(rows[:5], "随便", clean_cfg=cfg, max_chars=100000)
+    check("放得下就全给", small["trimmed"] is False and small["picked"] == 5)
+
+    got = qa.parse_answer('{"answer":"周五开会","refs":[1,"2",0,-1,3],"enough":true}')
+    check("解析 answer", bool(got) and got["answer"] == "周五开会")
+    check("refs 过滤非法值", bool(got) and got["refs"] == [1, 2, 3],
+          str(got["refs"] if got else None))
+    got = qa.parse_answer('```json\n{"answer":"包在围栏里","refs":[]}\n```')
+    check("去代码围栏", bool(got) and got["answer"] == "包在围栏里")
+    check("纯文本返回 None", qa.parse_answer("周五开会，别迟到") is None)
+    check("strip_fence 清理", qa.strip_fence("```\nx\n```") == "x")
+
+    first = picked["items"][0]["no"]
+    cites = qa.cite_items(picked, [first])
+    check("引用能对上消息", len(cites) == 1 and cites[0]["no"] == first)
+    check("不存在的编号忽略", qa.cite_items(picked, [99999]) == [])
+
+
 def test_upgrade() -> None:
     """老库（1.1.0 没有 media/points 列）能不能原地升级。"""
     print("\n[老库升级]")
@@ -432,6 +486,7 @@ async def test_end_to_end() -> None:
     await plugin.on_load()
     await plugin.on_enable()
     cmd_main.COOLDOWN_SECONDS = 0            # 测试里连跑几次总结，不等冷却
+    cmd_main.ASK_COOLDOWN = 0                # 连问几个问题，同样不等
 
     # ---- 命令注册：权限与作用域必须是框架声明，而不是插件自己判
     handlers = cmds.list_commands()
@@ -514,6 +569,54 @@ async def test_end_to_end() -> None:
         check("未结构化时给出原文提示", "没按格式输出" in reply, reply[:80])
     finally:
         llm.chat = original_chat
+
+    # ---- 提问（只读）
+    async def qa_chat(p, messages, *, model=""):
+        calls.append(messages)
+        return json.dumps({"answer": "开题报告明天 17:00 前交给张三。",
+                           "refs": [1], "enough": True}, ensure_ascii=False)
+
+    original_chat_qa = llm.chat
+    open_before = len(store.open_todos(GROUP))
+    try:
+        llm.chat = qa_chat
+        reply = await _cmd(plugin, ["ask", "开题报告什么时候交"])
+        check("ask 有答案", "开题报告明天" in reply, reply[:100])
+        check("ask 回显问题", "💬 开题报告什么时候交" in reply, reply[:60])
+        check("ask 带依据", "依据" in reply and "1）" in reply, reply[:150])
+        check("ask 不产生待办", len(store.open_todos(GROUP)) == open_before,
+              f"{open_before} → {len(store.open_todos(GROUP))}")
+        body = calls[-1][-1]["content"] if calls else ""
+        check("记录带编号喂给模型", "[1]" in body, body[:120])
+        check("问题在 prompt 里", "问题：开题报告什么时候交" in body, body[-120:])
+
+        # 不带 ask，直接把问题当命令发
+        reply = await _cmd(plugin, ["谁负责收表"])
+        check("不带 ask 也能直接问", "开题报告明天" in reply, reply[:80])
+
+        # 问题里带时间词 → 自动放宽窗口
+        reply = await _cmd(plugin, ["ask", "本周有什么要交的"])
+        check("「本周」被认出来", "本周有什么要交的" in reply and "范围" in reply,
+              reply[:100])
+
+        reply = await _cmd(plugin, ["ask"])
+        check("空问题给用法", "/sum ask 这周有什么要交的" in reply, reply[:120])
+
+        cmd_main.ASK_COOLDOWN = 3
+        plugin._last_ask[GROUP] = int(time.time())
+        reply = await _cmd(plugin, ["ask", "还在吗"])
+        check("追问也有冷却", "秒后再问" in reply, reply[:60])
+        cmd_main.ASK_COOLDOWN = 0
+
+        # 模型没按 JSON 回：原文当答案，不假装有引用
+        async def plain_chat(p, messages, *, model=""):
+            return "```\n开题报告明天交\n```"
+        llm.chat = plain_chat
+        reply = await _cmd(plugin, ["ask", "开题报告什么时候交"])
+        check("非 JSON 也照原文显示", "开题报告明天交" in reply and "```" not in reply,
+              reply[:120])
+    finally:
+        llm.chat = original_chat_qa
 
     # ---- 冷却
     cmd_main.COOLDOWN_SECONDS = 60
@@ -674,6 +777,7 @@ def main() -> int:
     test_report_parse()
     test_mode()
     test_llm_config()
+    test_qa()
     test_upgrade()
     try:
         asyncio.run(test_end_to_end())

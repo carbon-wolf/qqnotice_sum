@@ -41,6 +41,8 @@ ACTION_ALIASES = {
     "done": "done", "d": "done", "完": "done", "完成": "done",
     "drop": "drop", "弃": "drop", "忽略": "drop",
     "sync": "sync", "补": "sync", "补采": "sync",
+    "ask": "ask", "q": "ask", "question": "ask", "qa": "ask",
+    "问": "ask", "提问": "ask", "问问": "ask", "问一下": "ask",
     "config": "config", "cfg": "config", "set": "config",
     "设置": "config", "配置": "config",
     "status": "status", "状态": "status",

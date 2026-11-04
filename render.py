@@ -73,6 +73,7 @@ USAGE_LINES = [
     ("/sum summary [24h]", "总结一次：群内容摘要 + 待办；窗口可写 24h / today / 3d"),
     ("/sum digest [24h]", "只看群内容摘要（发了什么通知、聊了什么、结论是什么）"),
     ("/sum todo [24h]", "只看待办（跳过图片和附件，快且省 token）"),
+    ("/sum ask <问题>", "直接提问：谁负责 / 几点 / 在哪 / 要交什么（也能直接发问题）"),
     ("/sum list [all]", "未完成的待办（带 all 连已完成的一起列）"),
     ("/sum done <编号>", "标记完成，编号是列表里的 #数字"),
     ("/sum drop <编号>", "忽略某条（以后不再重复提醒）"),
@@ -106,6 +107,48 @@ def panel(plugin) -> str:
     lines.append("用法（私聊发；只有这一条命令）")
     for usage, desc in USAGE_LINES:
         lines.append("  " + _pad(usage, 26) + desc)
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ 问答
+
+def answer(plugin, group_id, *, question: str, res: dict) -> str:
+    """一次提问的回答 + 依据。"""
+    start_ts = int(res.get("start_ts") or 0)
+    end_ts = int(res.get("end_ts") or 0)
+    if res.get("empty"):
+        if res.get("reason") == "no_messages":
+            return (f"📭 {span_text(start_ts, end_ts)} 这段时间没采集到消息。\n"
+                    "把窗口放宽再问：`/sum ask 7d …`，或者先 `/sum sync 7d` "
+                    "从群历史补一次。")
+        return (f"📭 {span_text(start_ts, end_ts)} 的消息都是「收到 / 好的」这类"
+                "没有信息量的内容，答不了。")
+    if res.get("error"):
+        return f"❌ 没答上来：{res['error']}"
+
+    lines = [f"💬 {question}"]
+    stat = f"范围 {span_text(start_ts, end_ts)} · {int(res.get('total') or 0)} 条消息"
+    if res.get("trimmed"):
+        stat += f"（筛出 {int(res.get('picked') or 0)} 条相关的）"
+    if res.get("model"):
+        stat += f" · {res['model']}"
+    lines.append(stat)
+    lines.append("")
+
+    body = str(res.get("answer") or "").strip()
+    lines.append(body or "（模型没给出内容）")
+
+    cites = res.get("cites") or []
+    if cites:
+        lines.append("")
+        lines.append("依据")
+        for item in cites:
+            text = str(item.get("text") or "").replace("\n", " ").strip()
+            lines.append(f"  {item['no']}）{item['sender']} "
+                         f"{clock(int(item.get('ts') or 0))}：{text}")
+    if not res.get("enough", True):
+        lines.append("")
+        lines.append("（记录里信息不全，可以放宽窗口再问：`/sum ask 7d …`）")
     return "\n".join(lines)
 
 
@@ -373,6 +416,7 @@ def _db_hint(plugin) -> str:
 
 __all__ = [
     "clock", "span_text", "group_title", "panel", "summary", "unstructured", "result",
+    "answer", "mask_key",
     "todo_list", "closed_ack", "settings", "config_overview", "status",
     "PRIORITY_TAG", "STATUS_LABEL", "MODE_LABEL",
 ]

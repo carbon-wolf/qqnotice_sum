@@ -9,9 +9,10 @@
     collect.py         消息段 → 文本
     history.py         群历史消息补采
     digest.py          清洗、合并、预算裁剪
+    qa.py              提问：按问题筛消息 + 容错解析回答
     llm.py             OpenAI 兼容接口 + JSON 容错解析
-    render.py          面板 / 列表 / 总结的文案
-    store.py           四张表的模型
+    render.py          面板 / 列表 / 总结 / 回答的文案
+    store.py           五张表的模型
 
 数据全部走**框架提供的 sqlite ORM**：`napcat.store.Model` 声明表结构，
 `self.database(ensure=[...])` 拿库（文件落在 `plugins/qqnotice_sum/data/`，
@@ -46,8 +47,8 @@ COMMAND_NAME = "sum"
 
 class QQNoticeSumPlugin(PluginBase):
     name = "qqnotice_sum"
-    version = "1.3.0"
-    description = "通知群消息 → 待办：实时采集 + 历史补采，私聊查询 / 每日推送"
+    version = "1.4.0"
+    description = "通知群消息 → 摘要 / 待办 / 随时提问：实时采集 + 历史补采，私聊可用，每日推送"
     author = "carbon-wolf"
 
     # ------------------------------------------------------------------ 生命周期
@@ -57,6 +58,7 @@ class QQNoticeSumPlugin(PluginBase):
         self._bootstrapped: set[int] = set()      # 本进程已补过历史采的群
         self._pushing: set[int] = set()           # 正在推送的群（防重入）
         self._last_summary: dict[int, int] = {}   # 手动总结的冷却时刻
+        self._last_ask: dict[int, int] = {}       # 追问的冷却时刻（比总结短）
         self._last_catchup: dict[int, int] = {}   # 停机补漏的节流时刻
         self._pending_sync: dict[int, tuple] = {}  # 实时采集攒下的游标
         self._last_cleanup = ""                   # 上次清理的日期

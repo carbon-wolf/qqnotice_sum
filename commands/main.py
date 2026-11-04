@@ -27,7 +27,7 @@ from urllib.parse import urlsplit, urlunsplit
 from napcat.message import MessageChain
 from napcat.registry import command
 
-from .. import history, llm, render, schemas, service, store
+from .. import history, llm, qa, render, schemas, service, store
 
 #: 连按两次的冷却（秒）。一次总结要花 token，防手抖比防人更重要。
 COOLDOWN_SECONDS = 10
@@ -60,7 +60,12 @@ CONFIG_ALIASES = {
          aliases=["待办", "td"],
          description="通知群消息 → 待办：私聊查询 / 每日推送 / 群配置（仅管理员 · 仅私聊）")
 async def cmd_sum(plugin, params, event):
-    action, rest = schemas.parse_spec(getattr(params, "spec", None))
+    tokens = schemas.tokenize(getattr(params, "spec", None))
+    action, rest = schemas.parse_spec(tokens)
+    if action == "unknown":
+        # 认不出的第一个词直接当问题：`/sum 谁负责收表` 比记动作名自然。
+        # 拼错动作名时也只是「答一句记录里没提到」，不会做错事。
+        return await _act_ask(plugin, event, tokens)
     handler = _ACTIONS.get(action)
     if handler is None:
         return _out(f"没听懂「{action}」。发 `/sum` 看用法。")
@@ -177,6 +182,49 @@ async def _run_summary(plugin, event, rest, *, default_mode: str):
     result = await service.summarize(plugin, gid, start_ts=start_ts, end_ts=end_ts,
                                      mode=mode, catch_up_pages=3)
     return _out(render.result(plugin, gid, result))
+
+
+# ------------------------------------------------------------------ 动作：提问
+
+#: 追问的冷却（秒）。比总结短得多 —— 连着问「那谁负责」「什么时候截止」是正常用法。
+ASK_COOLDOWN = 3
+
+
+async def _act_ask(plugin, event, rest):
+    """就群里的内容提问。只读：不产生待办，也不动总结的冷却。"""
+    gid, span, tokens = _target(plugin, event, rest)
+    question = " ".join(tokens).strip()
+    if not question:
+        return _out(
+            "想问什么？比如：\n"
+            "  `/sum ask 这周有什么要交的`\n"
+            "  `/sum ask 谁负责收表`\n"
+            "  `/sum ask 开会定在几点`\n"
+            "\n"
+            "时间词可以直接写进问题（今天 / 昨天 / 本周 / 最近3天），"
+            "也可以放在前面：`/sum ask 7d 上次发的课表在哪`。\n"
+            "看的是**文字消息**（图片和附件不解析），"
+            "太久远的先 `/sum sync 30d` 补一下。")
+    if gid is None:
+        return _out(_need_group(plugin, "/sum ask <群号> <问题>"))
+    if not plugin.is_watched(gid):
+        return _out(f"群 {gid} 没有托管：`/sum config add {gid}`")
+
+    now = int(time.time())
+    last = plugin._last_ask.get(gid, 0)
+    if now - last < ASK_COOLDOWN:
+        return _out(f"⏳ 上一个问题还在处理，{ASK_COOLDOWN - (now - last)} 秒后再问。")
+    plugin._last_ask[gid] = now
+
+    # 问题里带了「本周」「最近 3 天」就按它来，否则用该群的默认窗口
+    if span is None:
+        span = qa.detect_span(question, now=now)
+    start_ts, end_ts = span if span is not None else service.window_for(plugin, gid)
+
+    result = await service.ask(plugin, gid, question=question,
+                               start_ts=start_ts, end_ts=end_ts,
+                               model=plugin.model_for(gid), catch_up_pages=2)
+    return _out(render.answer(plugin, gid, question=question, res=result))
 
 
 # ------------------------------------------------------------------ 动作：清单
@@ -619,6 +667,7 @@ _ACTIONS = {
     "summary": _act_summary,
     "digest": _act_digest,
     "todo": _act_todo,
+    "ask": _act_ask,
     "list": _act_list,
     "done": _act_done,
     "drop": _act_drop,
