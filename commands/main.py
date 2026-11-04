@@ -32,8 +32,8 @@ from .. import history, llm, qa, render, schemas, service, store
 #: 连按两次的冷却（秒）。一次总结要花 token，防手抖比防人更重要。
 COOLDOWN_SECONDS = 10
 
-#: 模型配置是**全局**的（不属于某个群），走单独分支，不参与群号解析。
-LLM_ITEMS = {"key", "api", "test"}
+#: 这些配置项是**全局**的（不针对某个群），走单独分支，不参与群号解析。
+GLOBAL_ITEMS = {"key", "api", "test", "incremental"}
 
 #: `api clear` 恢复到这个地址
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
@@ -47,6 +47,8 @@ CONFIG_ALIASES = {
     "push": "push", "推送": "push",
     "model": "model", "模型": "model",
     "mode": "mode", "模式": "mode", "产出": "mode",
+    "incremental": "incremental", "delta": "incremental",
+    "增量": "incremental", "接续": "incremental",
     "switch": "switch", "enabled": "switch", "开关": "switch", "启用": "switch",
     "default": "default", "默认": "default",
     "key": "key", "apikey": "key", "api-key": "key", "密钥": "key", "秘钥": "key",
@@ -175,12 +177,15 @@ async def _run_summary(plugin, event, rest, *, default_mode: str):
     plugin._last_summary[gid] = now
 
     if span is not None:
-        start_ts, end_ts = span
+        # 显式给了窗口就按给的来，不掺增量
+        plan = {"start_ts": span[0], "end_ts": span[1],
+                "incremental": False, "since_ts": 0, "capped": False}
     else:
-        start_ts, end_ts = service.window_for(plugin, gid)
+        plan = service.plan_window(plugin, gid)
 
-    result = await service.summarize(plugin, gid, start_ts=start_ts, end_ts=end_ts,
-                                     mode=mode, catch_up_pages=3)
+    result = await service.summarize(plugin, gid,
+                                     start_ts=plan["start_ts"], end_ts=plan["end_ts"],
+                                     window=plan, mode=mode, catch_up_pages=3)
     return _out(render.result(plugin, gid, result))
 
 
@@ -216,10 +221,12 @@ async def _act_ask(plugin, event, rest):
         return _out(f"⏳ 上一个问题还在处理，{ASK_COOLDOWN - (now - last)} 秒后再问。")
     plugin._last_ask[gid] = now
 
-    # 问题里带了「本周」「最近 3 天」就按它来，否则用该群的默认窗口
+    # 问题里带了「本周」「最近 3 天」就按它来，否则用固定回溯窗口。
+    # 注意这里**不用** window_for：那是增量窗口，对提问没意义
+    # （刚总结完再问，就只剩三分钟可看了）。
     if span is None:
         span = qa.detect_span(question, now=now)
-    start_ts, end_ts = span if span is not None else service.window_for(plugin, gid)
+    start_ts, end_ts = span if span is not None else service.window_full(plugin, gid)
 
     result = await service.ask(plugin, gid, question=question,
                                start_ts=start_ts, end_ts=end_ts,
@@ -299,10 +306,10 @@ async def _act_status(plugin, event, rest):
 # ------------------------------------------------------------------ 动作：配置
 
 async def _act_config(plugin, event, rest):
-    # 模型配置是全局的，先摘出来：`/sum config key sk-1234567890` 里那串
-    # 数字会被当成群号，走不到正确分支。
+    # 全局配置先摘出来：`/sum config key sk-1234567890` 里那串数字会被
+    # 当成群号，走不到正确分支。
     head = CONFIG_ALIASES.get(str(rest[0]).lower()) if rest else None
-    if head in LLM_ITEMS:
+    if head in GLOBAL_ITEMS:
         return _out(await _CONFIG_ACTIONS[head](plugin, event, None, rest[1:]))
 
     gid, _span, tokens = _target(plugin, event, rest, with_window=False)
@@ -569,6 +576,26 @@ async def _cfg_test(plugin, event, gid, args):
             f"模型：{cfg['model']}\n回复：{answer}")
 
 
+async def _cfg_incremental(plugin, event, gid, args):
+    """增量总结开关（全局：影响所有群的手动总结与定时推送）。"""
+    if not args:
+        on = plugin.incremental()
+        return (f"增量总结：{'开' if on else '关'}\n"
+                "  开 —— 每次从上一次总结结束的时刻开始，只处理新消息（省上下文）\n"
+                "  关 —— 每次回溯固定窗口（window_hours），会重复总结同段内容\n"
+                f"  上限 —— 一次最多往回补 {plugin.max_incremental_hours()} 小时\n"
+                "改：`/sum config incremental on|off`")
+    if not _is_superuser(plugin, event):
+        return "这个开关影响所有群，只有超管能改。"
+    value = schemas.parse_bool(args[0])
+    if value is None:
+        return "用法：`/sum config incremental on|off`"
+    plugin.set_default("incremental", value)
+    tail = ("以后每次只处理上次之后的新消息。" if value
+            else "以后每次都回溯 window_hours，注意会重复处理已经总结过的内容。")
+    return f"✅ 增量总结已{'开启' if value else '关闭'}。{tail}"
+
+
 def _is_superuser(plugin, event) -> bool:
     """框架的超管判定；拿不到权限管理器（冒烟/离线）时不拦。"""
     perm = getattr(plugin, "perm", None)
@@ -689,4 +716,5 @@ _CONFIG_ACTIONS = {
     "key": _cfg_key,
     "api": _cfg_api,
     "test": _cfg_test,
+    "incremental": _cfg_incremental,
 }

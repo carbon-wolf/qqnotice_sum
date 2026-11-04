@@ -5,10 +5,15 @@
 
 1. **标注**（`tag_rows`）—— 把消息文本里的 `[图片]` / `[文件:xxx]` 换成
    `[图1]` / `[文件1:xxx]`，这样模型能把附件和「谁在什么时候发的」对起来；
-2. **下载**（`_fetch`）—— 流式读、超限立刻中止，绝不让一个 200MB 的压缩包
-   把内存和额度一起吃掉；
+2. **下载**（`_read_media`）—— **先走框架的流式下载**（`download_file_image_stream`
+   / `download_file_stream`，让 NapCat 那边去取，它就在 QQ 环境里），
+   拿不到才自己直连兜底。边下边计数，超限立刻掐断；
 3. **解析**（`extract_text`）—— 按扩展名分流；PDF/Word/Excel 用可选依赖，
    没装就如实说明「解析不了」，不假装成功。
+
+为什么不能自己拉 URL：QQ 的图片链带防盗链（403）、群文件链要 cookie（401），
+消息段里的 `file` 又常是 `file://` 本地路径 —— aiohttp 一个都搞不定。
+这是最初版本图片/文件全挂的根因。
 
 尺寸上限、单次数量上限、缓存时长都在 `config.json → plugins.qqnotice_sum.media`。
 """
@@ -111,27 +116,135 @@ def _mime_of(blob: bytes) -> str:
     return "image/jpeg"
 
 
-async def _fetch(url: str, *, max_bytes: int, timeout: float) -> Optional[bytes]:
-    """流式下载，超过 `max_bytes` 立即放弃（返回 None）。"""
+async def _fetch(url: str, *, max_bytes: int, timeout: float) -> tuple[Optional[bytes], str]:
+    """直连下载，超过 `max_bytes` 立即放弃。
+
+    **只当兜底用**：QQ 的图片链带防盗链、群文件链要 cookie，直连经常 401/403；
+    `file://` 路径更是拉不到。真正干活的是 `_read_via_api`。
+    """
     if not url:
-        return None
+        return None, "没有可用的下载地址"
     client_timeout = aiohttp.ClientTimeout(total=float(timeout))
     try:
         async with aiohttp.ClientSession(timeout=client_timeout) as session:
             async with session.get(url) as resp:
+                if resp.status == 403:
+                    return None, "直连被拒（HTTP 403，多半是防盗链）"
                 if resp.status >= 400:
-                    return None
+                    return None, f"直连失败（HTTP {resp.status}）"
                 length = resp.headers.get("Content-Length")
                 if length and length.isdigit() and int(length) > max_bytes:
-                    return None
+                    return None, "超过大小上限"
                 buf = bytearray()
                 async for chunk in resp.content.iter_chunked(65536):
                     buf.extend(chunk)
                     if len(buf) > max_bytes:
-                        return None            # 超限：直接掐断，别继续下
-                return bytes(buf)
-    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-        return None
+                        return None, "超过大小上限"   # 超限：直接掐断
+                return bytes(buf), "ok"
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+        return None, f"直连出错（{type(e).__name__}）"
+
+
+async def _drain(stream, max_bytes: int) -> Optional[bytes]:
+    """把一个异步字节流读完，超限立刻停并关闭它。"""
+    buf = bytearray()
+    try:
+        async for chunk in stream:
+            if not chunk:
+                continue
+            buf.extend(chunk)
+            if max_bytes and len(buf) > max_bytes:
+                return None
+    finally:
+        close = getattr(stream, "aclose", None)
+        if close is not None:
+            try:
+                await close()
+            except Exception:               # noqa: BLE001 - 关流失败不该影响主流程
+                pass
+    return bytes(buf)
+
+
+async def _read_via_api(api, descriptor: dict, *, kind: str,
+                        max_bytes: int, timeout: float) -> tuple[Optional[bytes], str]:
+    """让框架（NapCat 那边）去取字节。
+
+    `download_file_image_stream` / `download_file_stream` 是走 WS 让 NapCat 自己
+    下载再分块传回来的 —— 它就在 QQ 环境里，能拿到我们直连拿不到的东西。
+    这也是**唯一**能处理 `file://` 路径和防盗链图片的方式。
+    """
+    method = ("download_file_image_stream" if kind == "image"
+              else "download_file_stream")
+    download = getattr(api, method, None)
+    if download is None:
+        return None, "框架版本不支持流式下载"
+
+    # 按可靠性排序：图片认 file_id / file；文件认 url 与 file_id
+    candidates: list[dict] = []
+    file_id = str(descriptor.get("file_id") or "").strip()
+    file_ref = str(descriptor.get("file") or "").strip()
+    url = str(descriptor.get("url") or "").strip()
+    if kind == "image":
+        if file_id:
+            candidates.append({"file_id": file_id})
+        if file_ref:
+            candidates.append({"file": file_ref})
+        if url:
+            candidates.append({"file": url})
+    else:
+        if url:
+            candidates.append({"file": url})
+        if file_id:
+            candidates.append({"file_id": file_id})
+        if file_ref:
+            candidates.append({"file": file_ref})
+
+    last = "没有可用的文件标识"
+    for kwargs in candidates:
+        try:
+            blob = await _drain(download(timeout=float(timeout), **kwargs),
+                                max_bytes)
+        except Exception as e:              # noqa: BLE001 - 换下一个标识再试
+            last = f"{type(e).__name__}: {str(e)[:80]}"
+            continue
+        if blob is None:
+            last = "超过大小上限"
+            continue
+        if blob:
+            return blob, "ok"
+        last = "取回来是空的"
+    return None, last
+
+
+async def _read_media(plugin, group_id, descriptor: dict, *, kind: str,
+                      max_bytes: int, timeout: float) -> tuple[Optional[bytes], str]:
+    """取附件字节：**先走框架 API**，拿不到才直连兜底。"""
+    target = dict(descriptor)
+    if kind == "file" and not str(target.get("url") or "").strip():
+        # 群文件得先换成 http 直链 —— `download_file` 认的是 url，不认群文件的
+        # busid/file_id。这个接口换出来的链自带鉴权参数。
+        got = await _file_url(plugin, group_id, descriptor)
+        if got:
+            target["url"] = got
+
+    api = getattr(plugin, "api", None)
+    reason = "没有 API 连接"
+    if api is not None:
+        blob, reason = await _read_via_api(api, target, kind=kind,
+                                          max_bytes=max_bytes, timeout=timeout)
+        if blob:
+            return blob, "ok"
+
+    # 兜底：公网 CDN 图片有时能直接下
+    url = str(target.get("url") or "").strip()
+    if not url and kind == "image":
+        url = await _image_url(plugin, descriptor)
+    if not url:
+        return None, reason
+    blob, direct = await _fetch(url, max_bytes=max_bytes, timeout=timeout)
+    if blob:
+        return blob, "ok"
+    return None, f"{reason}；直连也不行：{direct}"
 
 
 async def _image_url(plugin, descriptor: dict) -> str:
@@ -145,9 +258,18 @@ async def _image_url(plugin, descriptor: dict) -> str:
     try:
         info = await api.get_image(file=descriptor.get("file") or None,
                                    file_id=descriptor.get("file_id") or None)
-        return str(getattr(info, "url", "") or (info.get("url") if isinstance(info, dict) else "") or "")
+        return _url_of(info)
     except Exception:                       # noqa: BLE001 - 拿不到就跳过这张图
         return ""
+
+
+def _url_of(info) -> str:
+    """`FileInfo`（pydantic）或 dict，取 url。"""
+    if info is None:
+        return ""
+    if isinstance(info, dict):
+        return str(info.get("url") or "")
+    return str(getattr(info, "url", "") or "")
 
 
 async def _file_url(plugin, group_id, descriptor: dict) -> str:
@@ -161,12 +283,12 @@ async def _file_url(plugin, group_id, descriptor: dict) -> str:
     try:
         if file_id:
             data = await api.get_group_file_url(str(group_id), file_id)
-            if isinstance(data, dict):
-                return str(data.get("url") or "")
-        info = await api.get_file(file=descriptor.get("file") or None, file_id=file_id or None)
-        if isinstance(info, dict):
-            return str(info.get("url") or "")
-        return str(getattr(info, "url", "") or "")
+            got = _url_of(data)
+            if got:
+                return got
+        info = await api.get_file(file=descriptor.get("file") or None,
+                                  file_id=file_id or None)
+        return _url_of(info)
     except Exception:                       # noqa: BLE001
         return ""
 
@@ -299,11 +421,11 @@ async def gather(plugin, group_id: int, items: list[dict], *, cfg: dict) -> dict
             if size and image_bytes and size > image_bytes:
                 result["skipped"].append(f"{label}（{human_size(size)}，超过单张上限）")
                 continue
-            url = await _image_url(plugin, descriptor)
-            blob = await _fetch(url, max_bytes=image_bytes or 5 * 1024 * 1024,
-                                timeout=timeout)
+            blob, reason = await _read_media(
+                plugin, group_id, descriptor, kind="image",
+                max_bytes=image_bytes or 5 * 1024 * 1024, timeout=timeout)
             if not blob:
-                result["notes"].append(f"{label} 取不到（可能是外链失效）")
+                result["notes"].append(f"{label} 没取到：{reason}")
                 continue
             image_budget -= 1
             result["images"].append({
@@ -334,10 +456,11 @@ async def gather(plugin, group_id: int, items: list[dict], *, cfg: dict) -> dict
         if file_budget <= 0:
             result["skipped"].append(f"{label}（本次文件数已达上限）")
             continue
-        url = await _file_url(plugin, group_id, descriptor)
-        blob = await _fetch(url, max_bytes=file_bytes or 5 * 1024 * 1024, timeout=timeout)
+        blob, reason = await _read_media(
+            plugin, group_id, descriptor, kind="file",
+            max_bytes=file_bytes or 5 * 1024 * 1024, timeout=timeout)
         if not blob:
-            result["skipped"].append(f"{label}（下载失败或超过上限）")
+            result["skipped"].append(f"{label}（{reason}）")
             _cache(group_id, item, "", "error", size)
             continue
         file_budget -= 1

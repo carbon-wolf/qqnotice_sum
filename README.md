@@ -124,9 +124,55 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
 问题里点了某人名会给他的发言加权。同分时**新的优先** —— 预算不够时，
 刚发的通知比三天前的闲聊重要。
 
+## 增量总结
+
+**默认只处理「上次总结之后」的新消息**，而不是每次都回溯固定 24 小时。
+
+```
+你说「/sum summary」         → 从未总结过：回溯 window_hours（默认 24h）
+再「/sum summary」           → 📭 上次总结（15:48）之后没有新消息
+来了一条新的，再「/sum summary」→ 只处理那一条
+```
+
+这么做的理由很直接：昨天已经总结过的内容再喂一遍，既费 token，也会让
+「今天有什么事」被昨天的旧消息冲淡。定时推送同理 —— 晚上 9 点半推的
+就是**当天新增**的那一段。
+
+几条边界：
+
+| 情况 | 行为 |
+|---|---|
+| 从没总结过 | 回溯 `window_hours` |
+| 上次总结到现在跨度 > 7 天 | 截断到 7 天（`max_incremental_hours`），标「跨度已截到上限」 |
+| 刚总结完又要总结 | 直接说「没有新消息」，**不调模型** |
+| 手动给了窗口 | 完全不掺增量，按你给的来 |
+| 提问（ask） | **不用增量**，问的是一段时间就给完整一段 |
+
+想看完整一段就显式给窗口：`/sum summary 24h`。想彻底关掉：
+
+```
+/sum config incremental off
+```
+
+「上次总结」以**成功**那次为准：模型报错、返回没结构化时不算，下次会重试
+（游标不推进，不会静默丢消息）。
+
 ## 图片与附件
 
 通知群的干货经常在截图和附件里，所以：
+
+**取字节走框架的接口**，不是自己 HTTP 拉：
+
+```python
+api.download_file_image_stream(file=..., file_id=...)   # 图片
+api.download_file_stream(file=url, file_id=...)          # 文件
+```
+
+这是让 NapCat 那边去下载再分块传回来 —— 它就在 QQ 环境里，能拿到我们拿不到的东西。
+自己拉 URL 基本行不通：图片链带防盗链（403）、群文件链要 cookie（401）、
+消息段里的 `file` 常常是 `file://` 本地路径。**这是最初版本图片/文件全挂的根因**，
+1.5.0 修掉了。群文件还会先用 `get_group_file_url` 换成带鉴权的直链再下。
+流式读的途中就计数，超限立刻掐断，不会先把 200MB 读进内存再判断。
 
 * **图片**以 multimodal 方式直接发给模型（`image_url` + base64），聊天记录里会标成
   `[图1]`、`[图2]`，与附带的图片顺序一一对应；
@@ -218,7 +264,14 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
     "timeout": 120,
     "max_context_chars": 14000
   },
-  "defaults": { "window_hours": 24, "push_time": "21:30", "max_todos": 30, "mode": "all" },
+  "defaults": {
+    "window_hours": 24,
+    "push_time": "21:30",
+    "max_todos": 30,
+    "mode": "all",
+    "incremental": true,
+    "max_incremental_hours": 168
+  },
   "groups": {
     "987654321": {
       "name": "计算机学院通知群",
@@ -293,10 +346,19 @@ Msg.objects.filter(group_id=..., ts__gte=...)              # napcat.store.Model
 非空时**只有列出的群**会被分发消息。要么把通知群加进去，要么让 `bound_groups` 保持空、
 `all_groups: true`。也可能是机器人掉线过 —— 发 `/sum sync` 从群历史捞一次。
 
+如果是「上次总结（xx）之后没有新消息」，那是**增量在正常工作**，不是故障；
+想重看整段就 `/sum summary 24h`。
+
 **图片没被读懂**
 先确认用的是支持视觉的模型；再看日志有没有「模型不收图片，去掉图片重试」——
 有的话说明端点不支持 `image_url`，换模型或把 `media.image.enabled` 关掉。
 另外单张超过 `image.max_bytes` 的会被直接跳过。
+
+**图片 / 文件取不到**
+报告末尾会写具体原因（「超过单张上限」「取回来是空的」「napcat 超时」之类），
+先看那条。常见两类：一是 `media.image.max_bytes` / `file.max_bytes` 太小，
+二是框架与 NapCat 的连接断了 —— 附件是让 NapCat 去取的，连接不通就都取不到。
+确认 `config.json` 里 `media.enabled` 没被关掉。
 
 **PDF / Word 解析不了**
 报告里会写「格式需要额外依赖才能解析」。`pip install pypdf python-docx openpyxl` 即可。
@@ -317,7 +379,7 @@ Msg.objects.filter(group_id=..., ts__gte=...)              # napcat.store.Model
 ```bash
 cd /path/to/ncqqpy
 ./venv/Scripts/python.exe smoke_load.py                                   # 加载冒烟
-./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 181 项用例
+./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 200 项用例
 ```
 
 用例不连 QQ、不连网：端到端部分是真实插件实例 + 框架 sqlite，模型调用用假函数替换。
@@ -331,7 +393,7 @@ cd /path/to/ncqqpy
 | `events/message.py` | 实时采集落库（含附件坐标） |
 | `jobs/push.py` | 到点推送 / 停机补漏 / 历史清理 |
 | `service.py` | 总结 / 提问链路（命令与定时任务共用，保证去重口径一致） |
-| `media.py` | 图片下载与 base64、文件下载与解析、编号标注 |
+| `media.py` | 附件取字节（走框架流式下载，非直连）+ 解析 + 编号标注 |
 | `collect.py` | 消息段 → 文本 + 附件描述 |
 | `history.py` | 历史消息分页补采 |
 | `digest.py` | 清洗 / 合并 / 预算裁剪 / 提示词 |

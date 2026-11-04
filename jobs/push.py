@@ -77,11 +77,12 @@ async def push_group(plugin, group_id, *, now: int = 0) -> bool:
         return False
     plugin._pushing.add(group_id)
     try:
-        start_ts, end_ts = service.window_for(plugin, group_id)
+        plan = service.plan_window(plugin, group_id, now=now)
         # 先打标，避免这一分钟里被重复触发；失败也不再补推（下一分钟条件就不成立了）
         plugin.update_group(group_id, last_push_date=_today(now))
         result = await service.summarize(plugin, group_id,
-                                         start_ts=start_ts, end_ts=end_ts,
+                                         start_ts=plan["start_ts"],
+                                         end_ts=plan["end_ts"], window=plan,
                                          mode=plugin.mode_for(group_id),
                                          catch_up_pages=CATCHUP_PAGES)
         if result.get("empty"):
@@ -89,7 +90,7 @@ async def push_group(plugin, group_id, *, now: int = 0) -> bool:
                                group_id)
             return False
         text = render.result(plugin, group_id, result)
-        await send_text(plugin, group_id, "⏰ 每日待办\n\n" + text)
+        await send_text(plugin, group_id, "⏰ 群消息日报\n\n" + text)
         return True
     except Exception:                       # noqa: BLE001 - 定时任务不能把整个 tick 打挂
         plugin.logger.warning("[qqnotice_sum] 群 %s 定时推送失败", group_id, exc_info=True)

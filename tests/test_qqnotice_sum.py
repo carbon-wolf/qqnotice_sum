@@ -366,6 +366,152 @@ def test_qa() -> None:
     check("不存在的编号忽略", qa.cite_items(picked, [99999]) == [])
 
 
+def test_incremental() -> None:
+    """增量窗口：接上次、截断、关闭、空窗口，以及对提问不使用增量。"""
+    print("\n[增量窗口]")
+    from qqnotice_sum import service
+
+    base = 1_800_000_000
+
+    class P:
+        on = True
+
+        def incremental(self):
+            return self.on
+
+        def window_hours(self, gid):
+            return 24
+
+        def max_incremental_hours(self):
+            return 168
+
+    p = P()
+    original = store.last_run
+    try:
+        store.last_run = lambda gid: None
+        plan = service.plan_window(p, 1, now=base)
+        check("首次总结回落到 window_hours",
+              plan["end_ts"] - plan["start_ts"] == 24 * 3600)
+        check("首次不算增量", plan["incremental"] is False, str(plan))
+
+        class R1:
+            end_ts = base - 3600
+        store.last_run = lambda gid: R1()
+        plan = service.plan_window(p, 1, now=base)
+        # +1 秒：避开「同一秒里总结完又收到一条」的边界重复
+        check("增量从上次结束时刻（+1 秒）开始",
+              plan["start_ts"] == base - 3600 + 1, str(plan))
+        check("标的增量且记住 since",
+              plan["incremental"] is True and plan["since_ts"] == base - 3599, str(plan))
+
+        class R2:
+            end_ts = base - 30 * 86400
+        store.last_run = lambda gid: R2()
+        plan = service.plan_window(p, 1, now=base)
+        check("跨度超上限就截断",
+              plan["end_ts"] - plan["start_ts"] == 168 * 3600, str(plan))
+        check("截断时标 capped", plan["capped"] is True, str(plan))
+
+        class R3:
+            end_ts = base
+        store.last_run = lambda gid: R3()
+        plan = service.plan_window(p, 1, now=base)
+        check("刚总结过给空窗口",
+              plan["start_ts"] == plan["end_ts"] == base, str(plan))
+        # 空窗口也要认成增量 —— 否则界面上会显示「插件刚装没收到消息」这种误导
+        check("空窗口仍标为增量", plan["incremental"] is True, str(plan))
+
+        p.on = False
+        plan = service.plan_window(p, 1, now=base)
+        check("关掉增量退回固定窗口",
+              plan["end_ts"] - plan["start_ts"] == 24 * 3600, str(plan))
+        check("关掉增量不标增量", plan["incremental"] is False, str(plan))
+        p.on = True
+
+        store.last_run = lambda gid: R3()
+        start, end = service.window_full(p, 1, now=base)
+        check("提问用固定窗口（不受增量影响）", end - start == 24 * 3600,
+              f"{end - start}")
+
+        check("sync 只要范围也走增量",
+              service.window_for(p, 1, now=base)[0] == base)
+    finally:
+        store.last_run = original
+
+
+async def test_media_api() -> None:
+    """附件必须走框架的流式下载，而不是自己直连 URL。"""
+    print("\n[附件走框架 API]")
+    calls = []
+
+    class Api:
+        async def download_file_image_stream(self, *, file=None, file_id=None,
+                                             timeout=60.0, **kw):
+            calls.append(("image", file, file_id))
+            yield b"\x89PNG\r\n\x1a\n" + b"pixels"
+
+        async def download_file_stream(self, *, file=None, file_id=None,
+                                       timeout=60.0, **kw):
+            calls.append(("file", file, file_id))
+            yield "明天交表".encode("utf-8")
+
+    class P:
+        api = Api()
+
+    cfg = {"enabled": True, "timeout": 5, "cache_hours": 0,
+           "image": {"enabled": True, "max_bytes": 1024 * 1024, "max_per_run": 4},
+           "file": {"enabled": True, "max_bytes": 1024 * 1024, "max_per_run": 4,
+                    "max_chars": 500, "allow_ext": [".txt"]}}
+
+    items = [
+        {"kind": "image", "label": "图1", "index": 0,
+         "descriptor": {"file": "a.jpg", "file_id": "img-1"},
+         "row": {"message_id": 1}},
+        {"kind": "file", "label": "文件1", "index": 0,
+         "descriptor": {"name": "名单.txt", "file": "f-1",
+                        "url": "http://127.0.0.1:1/never"},
+         "row": {"message_id": 2}},
+    ]
+    out = await media.gather(P(), 1, items, cfg=cfg)
+    check("图片走 image_stream", bool(calls) and calls[0][0] == "image", str(calls))
+    check("图片拿成 data URI",
+          bool(out["images"])
+          and out["images"][0]["data_uri"].startswith("data:image/png;base64,"),
+          str(out["images"])[:80])
+    check("文件走 file_stream", any(c[0] == "file" for c in calls), str(calls))
+    check("文件解出正文",
+          bool(out["files"]) and out["files"][0]["status"] == "ok"
+          and "明天交表" in out["files"][0]["text"], str(out["files"])[:120])
+
+    # 全失败时要说清原因，不能静默跳过
+    class BadApi:
+        async def download_file_image_stream(self, **kw):
+            raise RuntimeError("napcat 550")
+            yield b""
+
+    class P2:
+        api = BadApi()
+
+    out = await media.gather(P2(), 1, [items[0]], cfg=cfg)
+    check("失败给出原因", not out["images"]
+          and any("550" in note for note in out["notes"]), str(out["notes"]))
+
+    # 超过上限时必须在拿完之前就停（_drain 的兜底）
+    class BigApi:
+        async def download_file_image_stream(self, *, file=None, file_id=None,
+                                             timeout=60.0, **kw):
+            for _ in range(4):
+                yield b"x" * 1024
+
+    class P3:
+        api = BigApi()
+
+    tiny = {**cfg, "image": {**cfg["image"], "max_bytes": 1024}}
+    out = await media.gather(P3(), 1, [items[0]], cfg=tiny)
+    check("流式超限就丢", not out["images"]
+          and any("超过大小上限" in note for note in out["notes"]), str(out["notes"]))
+
+
 def test_upgrade() -> None:
     """老库（1.1.0 没有 media/points 列）能不能原地升级。"""
     print("\n[老库升级]")
@@ -547,10 +693,10 @@ async def test_end_to_end() -> None:
         check("报告含【要点】", "【要点】" in reply)
         check("报告含【待办】", "【待办】" in reply)
 
-        digest_reply = await _cmd(plugin, ["digest"])
+        digest_reply = await _cmd(plugin, ["digest", "24h"])
         check("digest 只有摘要", "【概要】" in digest_reply and "【待办】" not in digest_reply,
               digest_reply[:80])
-        todo_reply = await _cmd(plugin, ["todo"])
+        todo_reply = await _cmd(plugin, ["todo", "24h"])
         check("todo 只有待办", "【待办】" in todo_reply and "【概要】" not in todo_reply,
               todo_reply[:80])
         check("模型收到了群消息", calls and "开题报告" in calls[0][1]["content"])
@@ -558,14 +704,18 @@ async def test_end_to_end() -> None:
               (calls[0][1]["content"][:120] if calls else ""))
         check("待办入库 2 条", len(store.open_todos(GROUP)) == 2)
 
-        await _cmd(plugin, ["summary"])
+        await _cmd(plugin, ["summary", "24h"])
         check("重复总结不新增", len(store.open_todos(GROUP)) == 2,
               f"实际 {len(store.open_todos(GROUP))}")
+
+        # 增量：不给窗口时接着上次，刚总结过就该说「没有新消息」而不是再跑一遍
+        reply = await _cmd(plugin, ["summary"])
+        check("增量：刚总结过提示没有新消息", "没有新消息" in reply, reply[:80])
 
         async def bad_chat(p, messages, *, model=""):
             return "这段时间大概有三件事要做吧"
         llm.chat = bad_chat
-        reply = await _cmd(plugin, ["summary"])
+        reply = await _cmd(plugin, ["summary", "24h"])
         check("未结构化时给出原文提示", "没按格式输出" in reply, reply[:80])
     finally:
         llm.chat = original_chat
@@ -621,7 +771,7 @@ async def test_end_to_end() -> None:
     # ---- 冷却
     cmd_main.COOLDOWN_SECONDS = 60
     plugin._last_summary[GROUP] = int(time.time())
-    reply = await _cmd(plugin, ["summary"])
+    reply = await _cmd(plugin, ["summary", "24h"])
     check("连点会被冷却拦住", "秒后再试" in reply, reply[:60])
     cmd_main.COOLDOWN_SECONDS = 0
 
@@ -639,11 +789,11 @@ async def test_end_to_end() -> None:
 
     # ---- 多群时要求带群号
     await _cmd(plugin, ["config", "add", str(GROUP2)])
-    reply = await _cmd(plugin, ["summary"])
+    reply = await _cmd(plugin, ["summary", "24h"])
     check("多群时提示带群号", "要指定群号" in reply, reply[:80])
     llm.chat = fake_chat
     try:
-        reply = await _cmd(plugin, ["summary", str(GROUP)])
+        reply = await _cmd(plugin, ["summary", str(GROUP), "24h"])
         check("带群号能跑", "提交开题报告" in reply or "没有采集到消息" in reply,
               reply[:80])
     finally:
@@ -778,6 +928,8 @@ def main() -> int:
     test_mode()
     test_llm_config()
     test_qa()
+    test_incremental()
+    asyncio.run(test_media_api())
     test_upgrade()
     try:
         asyncio.run(test_end_to_end())

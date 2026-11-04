@@ -170,6 +170,11 @@ def summary(plugin, group_id, res: dict) -> str:
         stat += f" · 文件 {media['files']}"
     if digest.get("sampled"):
         stat += " · 已抽样"
+    window = res.get("window") or {}
+    if window.get("incremental") and window.get("since_ts"):
+        stat += f" · 接上次（{clock(window['since_ts'])}）"
+    elif window.get("capped"):
+        stat += " · 跨度已截到上限"
     if res.get("model"):
         stat += f" · {res['model']}"
     lines.append(stat)
@@ -256,6 +261,11 @@ def result(plugin, group_id, res: dict) -> str:
     """把 `service.summarize()` 的结果渲染成一条消息。"""
     start_ts = int(res.get("start_ts") or 0)
     end_ts = int(res.get("end_ts") or 0)
+    window = res.get("window") or {}
+    if res.get("empty") and window.get("incremental") and window.get("since_ts"):
+        # 增量模式下「空」是好消息，不是故障，别吓人
+        return (f"📭 上次总结（{clock(window['since_ts'])}）之后没有新消息。\n"
+                "想重新看一遍就显式给窗口：`/sum summary 24h`。")
     if res.get("empty"):
         template = (_EMPTY_NO_MESSAGES if res.get("reason") == "no_messages"
                     else _EMPTY_NOISE)
@@ -333,6 +343,7 @@ def config_overview(plugin) -> str:
         "  model <名字>          该群用哪个模型（default = 跟随全局）",
         "  mode all|digest|todo  该群默认产出（摘要 / 待办 / 都要）",
         "  switch on|off         该群是否继续采集",
+        "  incremental on|off    增量总结：只处理上次之后的新消息（默认开）",
         "  default …             改全局默认（仅超管）",
         "",
         "模型（全局，仅超管 · 私聊里发，改完立即生效）",
@@ -395,8 +406,12 @@ def status(plugin) -> str:
         total = store.message_count(gid)
         open_count = len(store.open_todos(gid))
         last = clock(state.last_sync) if state is not None and state.last_sync else "从未"
+        run = store.last_run(gid)
+        summarized = (clock(run.created_at) if run is not None and run.created_at
+                      else "从未")
         lines.append(f"  · {group_title(plugin, gid)}")
-        lines.append(f"    消息 {total} 条 · 未完成待办 {open_count} 条 · 上次同步 {last}")
+        lines.append(f"    消息 {total} 条 · 未完成待办 {open_count} 条")
+        lines.append(f"    上次总结 {summarized} · 上次同步 {last}")
         lines.append(f"    推送 {plugin.push_time(gid) or '关'} · "
                      f"采集{'开' if plugin.is_watched(gid) else '关'} · "
                      f"窗口 {plugin.window_hours(gid)}h · 产出 {plugin.mode_for(gid)}")

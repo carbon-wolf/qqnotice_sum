@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import time
+from typing import Optional
 
 from . import digest, history, llm, media, qa, store
 
@@ -24,7 +25,7 @@ def mode_label(mode: str) -> str:
 
 
 async def summarize(plugin, group_id: int, *, start_ts: int, end_ts: int,
-                    model: str = "", mode: str = "all",
+                    window: Optional[dict] = None, model: str = "", mode: str = "all",
                     catch_up_pages: int = 3) -> dict:
     """跑一次总结。
 
@@ -44,6 +45,7 @@ async def summarize(plugin, group_id: int, *, start_ts: int, end_ts: int,
             "created": 0, "open": 0, "model": "",
             "cost_ms": 0, "mode": mode,
             "start_ts": int(start_ts), "end_ts": int(end_ts),
+            "window": window or _plain_window(start_ts, end_ts),
             "media": {"images": 0, "files": 0}, "media_skipped": []}
 
     # 1) 先把缺口补上（掉线 / 刚装插件 / 上一轮定时失败）
@@ -190,9 +192,63 @@ async def ask(plugin, group_id: int, *, question: str, start_ts: int, end_ts: in
             "cost_ms": cost_ms}
 
 
-def window_for(plugin, group_id) -> tuple[int, int]:
-    """该群默认窗口：`[现在 - N 小时, 现在]`。"""
-    end_ts = int(time.time())
+def plan_window(plugin, group_id, *, now: Optional[int] = None) -> dict:
+    """算这次总结要看的窗口，并把「是不是接着上次」一并带出来。
+
+    不要试图事后从 `(start_ts, end_ts)` 反推是不是增量 —— 空窗口和
+    刚总结完的情况反推不出来（`start == end` 既可能是增量被压成空，
+    也可能是本来就给了个空区间）。谁算的窗口谁最清楚。
+
+    Returns:
+        `{"start_ts", "end_ts", "incremental", "since_ts", "capped"}`
+    """
+    end_ts = int(now if now is not None else time.time())
+    hours = plugin.window_hours(group_id)
+    plan = {"start_ts": end_ts - hours * 3600, "end_ts": end_ts,
+            "incremental": False, "since_ts": 0, "capped": False}
+    if not plugin.incremental():
+        return plan
+
+    try:
+        last = store.last_run(group_id)
+    except Exception:                      # noqa: BLE001 - 读不到就按首次处理
+        last = None
+    since = int(getattr(last, "end_ts", 0) or 0) if last is not None else 0
+    if since <= 0:
+        return plan                        # 从没总结过 → 固定回溯
+
+    # +1 秒：run.end_ts 和消息 ts 都是整秒，同一秒里「总结完又收到一条」
+    # 会被下次重复喂进去。跳一秒不影响任何东西，但把边界重复挡掉了。
+    since += 1
+    plan.update({"incremental": True, "since_ts": since})
+
+    if since >= end_ts:                    # 刚总结过 / 时钟回拨 → 空窗口
+        plan["start_ts"] = end_ts
+        return plan
+
+    cap = plugin.max_incremental_hours() * 3600
+    if cap > 0 and end_ts - since > cap:
+        plan["start_ts"] = end_ts - cap    # 停机太久：截断，别一次塞爆上下文
+        plan["capped"] = True
+    else:
+        plan["start_ts"] = since
+    return plan
+
+
+def window_for(plugin, group_id, *, now: Optional[int] = None) -> tuple[int, int]:
+    """只要范围、不要说明时用这个（`/sum sync` 之类）。"""
+    plan = plan_window(plugin, group_id, now=now)
+    return plan["start_ts"], plan["end_ts"]
+
+
+def window_full(plugin, group_id, *, now: Optional[int] = None) -> tuple[int, int]:
+    """固定回溯窗口：`[现在 - window_hours, 现在]`。
+
+    **提问用这个，不用增量**。增量对总结有意义（昨天说过的不重复处理），
+    对提问没意义 —— 问「这周有什么要交的」，结果窗口只有三分钟，
+    因为三分钟前刚总结过。问的是一段时间，就给完整的一段。
+    """
+    end_ts = int(now if now is not None else time.time())
     return end_ts - plugin.window_hours(group_id) * 3600, end_ts
 
 
@@ -201,4 +257,11 @@ def _group_name(plugin, group_id) -> str:
     return str(cfg.get("name") or "").strip() or str(group_id)
 
 
-__all__ = ["summarize", "ask", "window_for", "MODES", "mode_label"]
+def _plain_window(start_ts: int, end_ts: int) -> dict:
+    """没传 plan 时的兜底（显式窗口、或直接调 service 的场景）。"""
+    return {"start_ts": int(start_ts), "end_ts": int(end_ts),
+            "incremental": False, "since_ts": 0, "capped": False}
+
+
+__all__ = ["summarize", "ask", "plan_window", "window_for", "window_full",
+           "MODES", "mode_label"]

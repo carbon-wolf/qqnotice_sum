@@ -40,6 +40,7 @@ DEFAULT_WINDOW_HOURS = 24
 DEFAULT_PUSH_TIME = "21:30"
 DEFAULT_MAX_TODOS = 30
 DEFAULT_RETENTION_DAYS = 60
+DEFAULT_MAX_INCREMENTAL_HOURS = 168        # 增量最多往回补 7 天
 
 #: 命令名与别名（`/help` 与文档都按这个口径写）
 COMMAND_NAME = "sum"
@@ -47,7 +48,7 @@ COMMAND_NAME = "sum"
 
 class QQNoticeSumPlugin(PluginBase):
     name = "qqnotice_sum"
-    version = "1.4.0"
+    version = "1.5.0"
     description = "通知群消息 → 摘要 / 待办 / 随时提问：实时采集 + 历史补采，私聊可用，每日推送"
     author = "carbon-wolf"
 
@@ -103,6 +104,11 @@ class QQNoticeSumPlugin(PluginBase):
                 "push_time": DEFAULT_PUSH_TIME,
                 "max_todos": DEFAULT_MAX_TODOS,
                 "mode": "all",              # all / digest / todo
+                # 增量总结：从上一次总结结束的时刻开始，只处理新消息。
+                # 关掉就每次回溯固定 window_hours。
+                "incremental": True,
+                # 增量的上限：停机一个月后不该一次塞爆上下文
+                "max_incremental_hours": 168,
             },
             # 群号 → 该群的采集/推送设置。空 = 一个群都不托管。
             "groups": {},
@@ -191,7 +197,20 @@ class QQNoticeSumPlugin(PluginBase):
             "push_time": _clock(block.get("push_time"), DEFAULT_PUSH_TIME),
             "max_todos": _positive_int(block.get("max_todos"), DEFAULT_MAX_TODOS),
             "mode": str(block.get("mode") or "all").strip().lower(),
+            "incremental": bool(block.get("incremental", True)),
+            "max_incremental_hours": _positive_int(
+                block.get("max_incremental_hours"), DEFAULT_MAX_INCREMENTAL_HOURS),
         }
+
+    def incremental(self) -> bool:
+        """增量总结：只处理「上次总结之后」的新消息。
+
+        名字不叫 `enabled` —— 框架的 `PluginBase.enabled` 是属性，别盖掉。
+        """
+        return self.defaults()["incremental"]
+
+    def max_incremental_hours(self) -> int:
+        return self.defaults()["max_incremental_hours"]
 
     def window_hours(self, group_id) -> int:
         return _positive_int(self.group_cfg(group_id).get("window_hours"),
@@ -392,4 +411,5 @@ def _clock(value, default: str) -> str:
 __all__ = [
     "QQNoticeSumPlugin", "COMMAND_NAME",
     "DEFAULT_WINDOW_HOURS", "DEFAULT_PUSH_TIME", "DEFAULT_MAX_TODOS",
+    "DEFAULT_MAX_INCREMENTAL_HOURS",
 ]
