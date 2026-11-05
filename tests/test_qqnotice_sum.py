@@ -968,6 +968,33 @@ async def test_end_to_end() -> None:
     finally:
         llm.chat = original_chat
 
+    # ---- 不指定群时，list 把所有托管群都列出来
+    store.upsert_todos(GROUP2, [{"title": "报志愿者名单", "owner": "小李",
+                                 "due": "2026-11-08 18:00", "priority": "high"}])
+    reply = await _cmd(plugin, ["list"])
+    check("不指定群也列出来", "计院26级通知群" in reply and "校团委志工部" in reply,
+          reply[:160])
+    check("两个群的待办都在", "提交开题报告" in reply and "报志愿者名单" in reply,
+          reply[:200])
+    check("汇总给出总数", "共" in reply and "条未完成" in reply, reply[-100:])
+
+    other = store.open_todos(GROUP2)[0]
+    reply = await _cmd(plugin, ["done", str(other["id"])])
+    check("done 自动认出所属群", "已完成" in reply and "报志愿者名单" in reply,
+          reply[:80])
+    check("确实关在它自己的群里", len(store.open_todos(GROUP2)) == 0)
+
+    alive = store.open_todos(GROUP)[0]
+    reply = await _cmd(plugin, ["done", "火星", str(alive["id"])])
+    check("群名认不出就不动手", "没认出群" in reply, reply[:60])
+    check("那条待办仍然开着", store.get_todo(int(alive["id"])).status == "open")
+
+    reply = await _cmd(plugin, ["list"])
+    check("没有待办的群也说一句", "没有未完成待办" in reply, reply[-200:])
+
+    reply = await _cmd(plugin, ["list", "火星"])
+    check("群名认不出会提示", "没认出群" in reply, reply[:60])
+
     # ---- 配置
     reply = await _cmd(plugin, ["config", "window", str(GROUP), "12h"])
     check("config window", plugin.window_hours(GROUP) == 12, reply[:60])

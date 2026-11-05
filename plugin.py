@@ -48,7 +48,7 @@ COMMAND_NAME = "sum"
 
 class QQNoticeSumPlugin(PluginBase):
     name = "qqnotice_sum"
-    version = "1.7.0"
+    version = "1.8.0"
     description = "通知群消息 → 摘要 / 待办 / 随时提问：实时采集 + 历史补采，私聊可用，每日推送"
     author = "carbon-wolf"
 

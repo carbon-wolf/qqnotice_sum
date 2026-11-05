@@ -36,8 +36,8 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
 /sum summary [24h] [mode]   摘要 + 待办（默认；mode = all / digest / todo）
 /sum digest  [24h]          只看群内容摘要
 /sum todo    [24h]          只看待办（跳过图片附件，快且省 token）
-/sum list    [all]          未完成的待办（all = 连已完成一起列）
-/sum done    <编号>         标记完成
+/sum list    [all]          待办清单：不带群名就列出**所有**托管群（all = 连已完成）
+/sum done    <编号>         标记完成（编号全局唯一，不用报群号）
 /sum drop    <编号>         忽略（以后不再重复提醒）
 /sum sync    [24h]          强制从群历史补采一次
 /sum ask     <问题>         直接提问（谁负责 / 几点 / 在哪 / 要交什么）
@@ -83,6 +83,33 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
 2. 提交开题报告
    截止 2026-11-09 23:59
 ```
+
+### 待办清单
+
+`/sum list` **不指定群就列出全部托管群** —— 查待办问的是「我还有哪些事」，
+不是「某个群有哪些事」，不该先拦一道问群号：
+
+```
+📋 待办清单 · 3 个群
+
+计院26级通知群（987654321）
+  #1 [高]交开题报告
+     截止 2026-11-06 17:00
+  #2 参加 302 全体会
+     @班长 · 截止 2026-11-06 15:00
+
+校团委志工部（987654322）
+  #3 报志愿者名单
+     @小李 · 截止 2026-11-08 18:00
+
+没有未完成待办：篮球队（987654323）
+
+共 3 条未完成。编号全局唯一，标记时不用报群号：
+/sum done <编号> 完成　/sum drop <编号> 忽略
+```
+
+待办的 `#编号` 是全局唯一的，所以 `/sum done 3` 就够，插件会自己认出 #3 属于哪个群。
+要只看某个群就照常说群名：`/sum list 计院`。看历史处理过的加 `all`。
 
 ## 提问
 
@@ -460,7 +487,7 @@ Msg.objects.filter(group_id=..., ts__gte=...)              # napcat.store.Model
 ```bash
 cd /path/to/ncqqpy
 ./venv/Scripts/python.exe smoke_load.py                                   # 加载冒烟
-./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 229 项用例
+./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 238 项用例
 ```
 
 用例不连 QQ、不连网：端到端部分是真实插件实例 + 框架 sqlite，模型调用用假函数替换。

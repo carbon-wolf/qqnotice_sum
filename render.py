@@ -74,7 +74,7 @@ USAGE_LINES = [
     ("/sum digest [24h]", "只看群内容摘要（发了什么通知、聊了什么、结论是什么）"),
     ("/sum todo [24h]", "只看待办（跳过图片和附件，快且省 token）"),
     ("/sum ask <问题>", "直接提问：谁负责 / 几点 / 在哪 / 要交什么（也能直接发问题）"),
-    ("/sum list [all]", "未完成的待办（带 all 连已完成的一起列）"),
+    ("/sum list [all]", "未完成的待办；不带群名就把所有托管群列出来（all 连已完成的一起）"),
     ("/sum done <编号>", "标记完成，编号是列表里的 #数字"),
     ("/sum drop <编号>", "忽略某条（以后不再重复提醒）"),
     ("/sum sync [24h]", "强制从群历史补采一次"),
@@ -304,6 +304,66 @@ def todo_list(plugin, group_id, *, include_closed: bool = False) -> str:
     return "\n".join(lines)
 
 
+def todo_list_all(plugin, group_ids, *, include_closed: bool = False) -> str:
+    """跨群汇总清单 —— 不指定群时 `/sum list` 的输出。
+
+    待办的 `id` 是主键、全局唯一，所以汇总里的 `#12` 可以直接
+    `/sum done 12`，不用回头再报群号（`_close_action` 会按编号反查群）。
+    """
+    gids = [int(g) for g in group_ids]
+    lines = [f"📋 待办清单 · {len(gids)} 个群"]
+    total = 0
+    empty: list[int] = []
+    blocks: list[str] = []
+
+    for gid in gids:
+        rows = store.open_todos(gid)
+        closed: list[dict] = []
+        if include_closed:
+            closed = [r.to_dict() for r in
+                      store.Todo.objects.filter(group_id=gid).order_by("-id").limit(30)
+                      if r.status != "open"]
+        if not rows and not closed:
+            empty.append(gid)
+            continue
+        total += len(rows)
+        part = [group_title(plugin, gid)]
+        if rows:
+            for todo in rows:
+                part.extend("  " + piece for piece in _todo_line(todo).split("\n"))
+        else:
+            part.append("  没有未完成待办")
+        if closed:
+            part.append("  最近处理过：")
+            for todo in closed[:5]:
+                label = STATUS_LABEL.get(str(todo.get("status")), "")
+                part.append(f"    #{todo.get('id')} {label} "
+                            f"{str(todo.get('title') or '').strip()}")
+        blocks.append("\n".join(part))
+
+    if not blocks:
+        lines.append("")
+        lines.append("所有托管的群都没有未完成待办。")
+        lines.append("要看新的就 `/sum summary <群名>` 生成一份。")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("\n\n".join(blocks))
+
+    if empty:
+        # 有内容的群已经列完了，剩下的单独说一句，别每个都占三行
+        listed = "、".join(group_title(plugin, gid) for gid in empty[:6])
+        more = f" 等 {len(empty)} 个群" if len(empty) > 6 else ""
+        lines.append("")
+        lines.append(f"没有未完成待办：{listed}{more}")
+
+    lines.append("")
+    lines.append(f"共 {total} 条未完成。编号全局唯一，标记时不用报群号：" if total
+                 else "这几项都已在处理中。标记时不用报群号：")
+    lines.append("/sum done <编号> 完成　/sum drop <编号> 忽略")
+    return "\n".join(lines)
+
+
 def closed_ack(todo: dict, status: str) -> str:
     label = STATUS_LABEL.get(status, "已处理")
     owner = str(todo.get("owner") or "").strip()
@@ -452,6 +512,6 @@ def _db_hint(plugin) -> str:
 __all__ = [
     "clock", "span_text", "group_title", "panel", "summary", "unstructured", "result",
     "answer", "mask_key",
-    "todo_list", "closed_ack", "settings", "config_overview", "status",
+    "todo_list", "todo_list_all", "closed_ack", "settings", "config_overview", "status",
     "PRIORITY_TAG", "STATUS_LABEL", "MODE_LABEL",
 ]

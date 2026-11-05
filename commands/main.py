@@ -271,12 +271,27 @@ async def _act_ask(plugin, event, rest):
 
 # ------------------------------------------------------------------ 动作：清单
 
+_ALL_WORDS = ("all", "全部", "全", "所有")
+
+
 async def _act_list(plugin, event, rest):
+    """待办清单。**不指定群就把所有托管群都列出来** —— 查待办本来就是
+    「我还有哪些事」，不是「某个群有哪些事」，不该先拦一道问群号。
+    """
     gid, _span, tokens = _target(plugin, event, rest, with_window=False)
-    if gid is None:
-        return _out(_need_group(plugin, "/sum list <群号>"))
-    include_closed = any(t.lower() in ("all", "全部", "全") for t in tokens)
-    return _out(render.todo_list(plugin, gid, include_closed=include_closed))
+    include_closed = any(t.lower() in _ALL_WORDS for t in tokens)
+    unknown = [t for t in tokens if t.lower() not in _ALL_WORDS]
+    if gid is not None:
+        return _out(render.todo_list(plugin, gid, include_closed=include_closed))
+
+    groups = sorted(plugin.group_ids())
+    if not groups:
+        return _out("还没有托管任何群。先加一个：`/sum config add <群号>`")
+    text = render.todo_list_all(plugin, groups, include_closed=include_closed)
+    if unknown:
+        # 写了个认不出的群名：先说一声，免得以为过滤生效了
+        text = f"⚠️ 没认出群「{unknown[0]}」，下面是全部托管群。\n\n" + text
+    return _out(text)
 
 
 async def _act_done(plugin, event, rest):
@@ -291,16 +306,26 @@ async def _close_action(plugin, event, rest, *, status: str):
     verb = "done" if status == "done" else "drop"
     gid, _span, tokens = _target(plugin, event, rest, with_window=False,
                                  group_min_tokens=2)
-    if gid is None:
-        return _out(_need_group(plugin, f"/sum {verb} <群号> <编号>"))
     if not tokens:
         return _out(f"用法：`/sum {verb} <编号>`，编号是 `/sum list` 里的 #数字。")
     todo_id = schemas.parse_number(tokens[-1], minimum=1, maximum=10 ** 9)
     if todo_id is None:
         return _out(f"「{tokens[-1]}」不是有效编号。用法：`/sum {verb} <编号>`。")
+    extra = [t for t in tokens[:-1] if schemas.parse_number(t) is None]
+    if extra:
+        # `/sum done 火星 12` —— 群名没认出来就别闷头关掉 #12
+        return _out(f"没认出群「{extra[0]}」。只看全部群的清单：`/sum list`。")
     row = store.get_todo(todo_id)
+    if row is not None and gid is None:
+        # 编号是全局唯一的，能自己认出属于哪个群 —— `/sum list` 现在是汇总的，
+        # 让用户看完再回头补群号等于白问一遍。
+        owner_gid = int(row.group_id)
+        if plugin.is_watched(owner_gid):
+            gid = owner_gid
+    if gid is None:
+        return _out(_need_group(plugin, f"/sum {verb} <群名或群号> <编号>"))
     if row is None or int(row.group_id) != int(gid):
-        return _out(f"没找到 #{todo_id}（本群的待办编号见 `/sum list`）。")
+        return _out(f"没找到 #{todo_id}（编号见 `/sum list`）。")
     if row.status != "open":
         return _out(f"#{todo_id} 已经处理过了（{render.STATUS_LABEL.get(row.status, row.status)}）。")
     try:
