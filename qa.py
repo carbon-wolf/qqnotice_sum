@@ -156,7 +156,7 @@ def select(rows: Iterable[dict], question: str, *, clean_cfg: dict,
 
 SYSTEM_PROMPT = """你是 QQ 群消息的问答助手。用户会给你一段群聊天记录（每条前面有 [编号]， \
 可能含 [图N]/[文件N] 占位），然后提一个问题。
-
+{persona_block}
 规则：
 1. 只根据记录回答。记录里没有就直说「记录里没提到」，不要用常识补，也不要猜。
 2. 回答简短：先给结论，最多 3 句。需要罗列时用「- 」开头，最多 5 条。
@@ -170,8 +170,20 @@ SYSTEM_PROMPT = """你是 QQ 群消息的问答助手。用户会给你一段群
 记录不足以回答时 enough 为 false，并在 answer 里说明还缺什么。"""
 
 
+def persona_block(persona: str) -> str:
+    """提问者的身份。与总结共用一套语义，只是侧重「怎么答」。"""
+    text = str(persona or "").strip()
+    if not text:
+        return ""
+    return (
+        f"\n【提问者的身份】{text}\n\n"
+        "回答时站在这个身份的角度：只答跟他相关的；需要他去做的事，"
+        "直接用「你要…」的口吻说，别绕。\n"
+    )
+
+
 def build_messages(*, group_name: str, question: str, selected: dict,
-                   start_ts: int, end_ts: int) -> list[dict]:
+                   start_ts: int, end_ts: int, persona: str = "") -> list[dict]:
     span = (f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(start_ts))} ~ "
             f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(end_ts))}")
     head = [
@@ -185,7 +197,8 @@ def build_messages(*, group_name: str, question: str, selected: dict,
     user = ("\n".join(head) + "\n\n" + selected["text"]
             + f"\n\n问题：{question}")
     return [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system",
+         "content": SYSTEM_PROMPT.replace("{persona_block}", persona_block(persona))},
         {"role": "user", "content": user},
     ]
 
@@ -262,5 +275,5 @@ def cite_items(selected: dict, refs: Iterable[int]) -> list[dict]:
 
 __all__ = [
     "detect_span", "grams", "question_grams", "select", "build_messages",
-    "parse_answer", "cite_items", "strip_fence", "SYSTEM_PROMPT",
+    "parse_answer", "cite_items", "strip_fence", "persona_block", "SYSTEM_PROMPT",
 ]

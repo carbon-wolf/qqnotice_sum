@@ -78,7 +78,7 @@ USAGE_LINES = [
     ("/sum done <编号>", "标记完成，编号是列表里的 #数字"),
     ("/sum drop <编号>", "忽略某条（以后不再重复提醒）"),
     ("/sum sync [24h]", "强制从群历史补采一次"),
-    ("/sum config …", "群配置：add / del / window / time / push / model / switch"),
+    ("/sum config …", "群配置：add / del / name / persona / window / time / push / model"),
     ("/sum status", "采集与模型状态"),
 ]
 
@@ -343,6 +343,8 @@ def config_overview(plugin) -> str:
         "  model <名字>          该群用哪个模型（default = 跟随全局）",
         "  mode all|digest|todo  该群默认产出（摘要 / 待办 / 都要）",
         "  switch on|off         该群是否继续采集",
+        "  name <新名称>         给群起个好认的名字（也是选择群的关键词）",
+        "  persona <身份>        总结时的身份，如「26级学委」（决定筛什么）",
         "  incremental on|off    增量总结：只处理上次之后的新消息（默认开）",
         "  default …             改全局默认（仅超管）",
         "",
@@ -357,7 +359,15 @@ def config_overview(plugin) -> str:
     gids = sorted(plugin.group_ids())
     if gids:
         lines.append("")
-        lines.append(f"已托管 {len(gids)} 个群：" + "、".join(str(g) for g in gids))
+        lines.append(f"已托管 {len(gids)} 个群（说话时用群号或名字都行）：")
+        for gid in gids[:10]:
+            lines.append(f"  {group_title(plugin, gid)}")
+        if len(gids) > 10:
+            lines.append(f"  …还有 {len(gids) - 10} 个")
+    persona = plugin.defaults()["persona"]
+    if persona:
+        lines.append("")
+        lines.append(f"全局身份：{persona}")
     return "\n".join(lines)
 
 
@@ -376,6 +386,14 @@ def settings(plugin, group_id) -> str:
     lines.append(f"  模型：{plugin.model_for(group_id) or '跟随全局 ' + plugin.llm_cfg()['model']}")
     mode = plugin.mode_for(group_id)
     lines.append(f"  产出：{mode}（{MODE_LABEL.get(mode, '摘要 + 待办')}）")
+    local = str(cfg.get("persona") or "").strip()
+    global_persona = plugin.defaults()["persona"]
+    if local:
+        lines.append(f"  身份：{local}")
+    elif global_persona:
+        lines.append(f"  身份：{global_persona}（继承全局）")
+    else:
+        lines.append("  身份：未设置（什么都要）；设一个更贴你：`/sum config persona 26级学委`")
     mcfg = plugin.media_cfg()
     lines.append(f"  图片：{'开 · 单张 ≤ ' + _size(mcfg['image']['max_bytes']) + ' · 每次 ≤ ' + str(mcfg['image']['max_per_run']) + ' 张' if mcfg['image']['enabled'] else '关'}")
     lines.append(f"  文件：{'开 · 单个 ≤ ' + _size(mcfg['file']['max_bytes']) + ' · 每次 ≤ ' + str(mcfg['file']['max_per_run']) + ' 个' if mcfg['file']['enabled'] else '关'}")
@@ -415,6 +433,8 @@ def status(plugin) -> str:
         lines.append(f"    推送 {plugin.push_time(gid) or '关'} · "
                      f"采集{'开' if plugin.is_watched(gid) else '关'} · "
                      f"窗口 {plugin.window_hours(gid)}h · 产出 {plugin.mode_for(gid)}")
+        if plugin.persona_for(gid):
+            lines.append(f"    身份 {plugin.persona_for(gid)}")
     lines.append("")
     lines.append(f"  当前时间：{clock(now, '%Y-%m-%d %H:%M')}")
     return "\n".join(lines)

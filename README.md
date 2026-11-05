@@ -48,8 +48,19 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
 中文别名同样可用：`总结` / `摘要` / `待办` / `列表` / `完` / `弃` / `补` / `设置` / `状态`。
 窗口写法：`24h` `12h` `90m` `3d` `1d12h` `today` `yesterday` `week` `all`。
 
-**群号可以省略**：只托管一个群时直接 `/sum summary`；多个群时用
-`/sum summary 987654321 24h` 指定（不指定会回一句已托管列表）。
+**群号可以省略**：只托管一个群时直接 `/sum summary`。
+
+托管群不止一个时，用**群名**比记号码省事得多：
+
+```text
+/sum config add 987654321        ← 加的时候会自动把群名拉下来
+/sum summary 计院 24h            ← 名字里的一段就行
+/sum summary 计院26级通知群 24h   ← 全名当然也行
+/sum summary 987654321 24h       ← 群号仍然可用
+```
+
+认不出或者撞名了，会直接把已托管的群列出来（带名字和群号），照着说一遍就行。
+名字想改就 `/sum config name 计院 26级通知（改）`；接口查不到名字时也可以手动设。
 
 ### 输出长什么样
 
@@ -123,6 +134,42 @@ pip install pypdf python-docx openpyxl    # 全可选，不装就只解析纯文
 所以这里按相关度筛：命中的二元组越多越靠前，长消息做长度惩罚（防一篇长文霸榜），
 问题里点了某人名会给他的发言加权。同分时**新的优先** —— 预算不够时，
 刚发的通知比三天前的闲聊重要。
+
+## 身份
+
+「待办」这两个字对不同人是不同的东西。学委看到的是「要交的作业」，
+班长看到的是「要通知到的人」，干事看到的是「要报的材料」。
+
+所以可以给总结设一个身份：
+
+```text
+/sum config persona 26级学委
+/sum config persona 班级心理委员，只关心统计和上报
+/sum config persona                       ← 看当前设成什么
+/sum config persona clear                 ← 清空
+/sum config persona 987654321 班长        ← 只给某个群设
+```
+
+它**主要影响筛什么，不只是措辞**。设成「26级学委」之后，提示词里会多出这一段：
+
+```text
+【你的身份】26级学委
+
+先想清楚这个身份在群里关心什么，再按这个视角处理：
+1. 只把**这个身份需要跟进或知道**的事列进待办；与它无关的
+   （别的年级、别的部门、纯通知性质）不要列，除非明确要求全员参与；
+2. 优先级按这个身份的紧迫感判断 —— 自己要被催、有截止日期的排前面；
+3. 概要按这个身份的口吻写，像同班同学直接告诉你，别写成公文。
+```
+
+没设身份时这一段不会出现，prompt 跟以前一模一样 —— 不想用就别设，不影响。
+
+两条规则：
+
+* **群级 > 全局**。同一个号可能在两个群里是两个身份（在班级群是学委，
+  在社团群是普通成员），所以群级设置会覆盖全局。
+* **提问也跟着换视角**。`ask` 用的是「提问者的身份」，需要你去做的事会直接说
+  「你要…」。
 
 ## 增量总结
 
@@ -280,12 +327,14 @@ self.api.download_file(url=...)                           # 更老的框架只�
     "push_time": "21:30",
     "max_todos": 30,
     "mode": "all",
+    "persona": "",
     "incremental": true,
     "max_incremental_hours": 168
   },
   "groups": {
     "987654321": {
       "name": "计算机学院通知群",
+      "persona": "26级学委",
       "enabled": true,
       "window_hours": 24,
       "push_time": "21:30",
@@ -387,6 +436,11 @@ Msg.objects.filter(group_id=..., ts__gte=...)              # napcat.store.Model
 实在用不了就把 `history.max_pages` 设成 `0`：跳过历史补采，只靠实时采集
 （从装插件那一刻起积累）。
 
+**`config add` 之后没显示群名**
+`get_group_info` 没返回（权限不足、连接问题，或者这个群拿不到信息）。
+不影响功能，群号照样能用；想按名字选群就手动起一个：
+`/sum config name 计院通知群`。
+
 **PDF / Word 解析不了**
 报告里会写「格式需要额外依赖才能解析」。`pip install pypdf python-docx openpyxl` 即可。
 
@@ -406,7 +460,7 @@ Msg.objects.filter(group_id=..., ts__gte=...)              # napcat.store.Model
 ```bash
 cd /path/to/ncqqpy
 ./venv/Scripts/python.exe smoke_load.py                                   # 加载冒烟
-./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 210 项用例
+./venv/Scripts/python.exe -B plugins/qqnotice_sum/tests/test_qqnotice_sum.py  # 229 项用例
 ```
 
 用例不连 QQ、不连网：端到端部分是真实插件实例 + 框架 sqlite，模型调用用假函数替换。

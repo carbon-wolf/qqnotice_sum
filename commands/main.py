@@ -49,6 +49,9 @@ CONFIG_ALIASES = {
     "mode": "mode", "模式": "mode", "产出": "mode",
     "incremental": "incremental", "delta": "incremental",
     "增量": "incremental", "接续": "incremental",
+    "name": "name", "rename": "name", "名称": "name", "群名": "name", "改名": "name",
+    "persona": "persona", "role": "persona", "identity": "persona",
+    "角色": "persona", "身份": "persona", "视角": "persona",
     "switch": "switch", "enabled": "switch", "开关": "switch", "启用": "switch",
     "default": "default", "默认": "default",
     "key": "key", "apikey": "key", "api-key": "key", "密钥": "key", "秘钥": "key",
@@ -101,6 +104,9 @@ def _target(plugin, event, rest: list[str], *, with_window: bool = True,
     tokens = list(rest)
     if gid is None and tokens and len(tokens) >= group_min_tokens:
         maybe = schemas.parse_group_id(tokens[0])
+        if maybe is None:
+            # 群名也认：「/sum summary 计院 24h」
+            maybe = _match_group_name(plugin, tokens[0])
         if maybe is not None:
             gid = maybe
             tokens.pop(0)
@@ -116,12 +122,41 @@ def _target(plugin, event, rest: list[str], *, with_window: bool = True,
     return gid, span, tokens
 
 
+def _match_group_name(plugin, token) -> Optional[int]:
+    """按群名（或名字片段）找群，只认唯一命中。
+
+    「计院」能匹配到「计院26级通知群」。歧义时返回 None —— 上层会列出
+    全部群让它重说，比猜错强。
+    """
+    key = str(token or "").strip()
+    if len(key) < 2:
+        return None                       # 一个字太容易撞
+    if schemas.parse_group_id(key) is not None:
+        return None                       # 纯数字是群号，不走这里
+    hits = []
+    for gid in sorted(plugin.group_ids()):
+        name = str(plugin.group_cfg(gid).get("name") or "").strip()
+        if not name:
+            continue
+        if key in name or (len(name) >= 2 and name in key):
+            hits.append(gid)
+    return hits[0] if len(hits) == 1 else None
+
+
 def _need_group(plugin, example: str) -> str:
     known = sorted(plugin.group_ids())
     if not known:
         return "还没有托管任何群。先加一个：`/sum config add <群号>`"
-    listed = "、".join(str(g) for g in known)
-    return f"要指定群号：`{example}`\n已托管：{listed}"
+    # 示例里统一标成「群名或群号」，省得以为只能报数字
+    example = example.replace("<群号>", "<群名或群号>")
+    lines = [f"要指定是哪个群：`{example}`", "", "已托管："]
+    for gid in known[:10]:
+        lines.append(f"  {render.group_title(plugin, gid)}")
+    if len(known) > 10:
+        lines.append(f"  …还有 {len(known) - 10} 个")
+    lines.append("")
+    lines.append("群号或群名都行，群名可以只写几个字（如「计院」）。")
+    return "\n".join(lines)
 
 
 def _out(text: str):
@@ -348,9 +383,18 @@ async def _cfg_add(plugin, event, gid, args):
         return "要指定群号：`/sum config add <群号>`"
     existed = bool(plugin.group_cfg(gid))
     plugin.update_group(gid, enabled=True)
+    # 顺手把群名拉下来 —— 之后列群、按名字选群都靠它
+    name = await _fetch_group_name(plugin, gid)
+    if name:
+        plugin.update_group(gid, name=name)
     head = "ℹ️ 本来就在托管" if existed else "✅ 已托管"
-    lines = [f"{head}：{render.group_title(plugin, gid)}",
-             f"窗口 {plugin.window_hours(gid)}h · 每日推送 {plugin.push_time(gid) or '关'}"]
+    lines = [f"{head}：{render.group_title(plugin, gid)}"]
+    if not name:
+        lines.append("（没拿到群名，可以手动设：`/sum config name 计院通知群`）")
+    lines.append(f"窗口 {plugin.window_hours(gid)}h · 每日推送 {plugin.push_time(gid) or '关'}")
+    if not plugin.persona_for(gid):
+        lines.append("")
+        lines.append("想让总结更贴你？设个身份：`/sum config persona 26级学委`")
     bound = _framework_bound_groups(plugin)
     if bound and gid not in bound:
         lines.append("")
@@ -580,6 +624,122 @@ async def _cfg_test(plugin, event, gid, args):
             f"模型：{cfg['model']}\n回复：{answer}")
 
 
+async def _fetch_group_name(plugin, gid) -> str:
+    """问接口要群名。拿不到就算了 —— 名字只影响好不好选，不影响功能。"""
+    api = getattr(plugin, "api", None)
+    if api is None:
+        return ""
+    try:
+        info = await api.get_group_info(str(gid))
+    except Exception as e:                 # noqa: BLE001
+        plugin.logger.info("[qqnotice_sum] 取群名失败（%s）：%s", gid, e)
+        return ""
+    if isinstance(info, dict):
+        name = info.get("group_name") or info.get("name")
+    else:
+        name = getattr(info, "group_name", None) or getattr(info, "name", None)
+    return str(name or "").strip()[:60]
+
+
+async def _cfg_name(plugin, event, gid, args):
+    """给群起名（接口拿不到、或者想叫顺口一点）。名称同时是选择群的关键词。"""
+    rest = list(args)
+    if gid is None and len(rest) >= 2:
+        matched = _match_group_name(plugin, rest[0])
+        if matched is not None:
+            gid = matched
+            rest = rest[1:]
+    gid = gid or _first_group_id(rest)
+    if gid is None:
+        return _need_group(plugin, "/sum config name <群号或群名> <新名称>")
+    rest = [t for t in rest if schemas.parse_group_id(t) is None]
+    if not rest:
+        current = str(plugin.group_cfg(gid).get("name") or "").strip()
+        hint = "" if current else "\n（没有名字，试 `/sum config name 计院通知群`；也可以 `name auto` 从接口拉）"
+        return f"当前名称：{current or '（未设置）'}{hint}"
+    name = " ".join(rest).strip()[:60]
+    if name.lower() == "auto":
+        fetched = await _fetch_group_name(plugin, gid)
+        if not fetched:
+            return "接口没给回群名（可能是权限或连接问题），手动起一个吧。"
+        name = fetched
+    plugin.update_group(gid, name=name)
+    return f"✅ 名称改成「{name}」\n以后可以直接说：`/sum summary {name}`"
+
+
+async def _cfg_persona(plugin, event, gid, args):
+    """设置总结时的「身份」——它决定哪些事算你的、哪些可以不管。"""
+    rest = list(args)
+    if gid is None and len(rest) >= 2:
+        matched = _match_group_name(plugin, rest[0])
+        if matched is not None:
+            gid = matched
+            rest = rest[1:]
+    gid = gid or _first_group_id(rest)
+    rest = [t for t in rest if schemas.parse_group_id(t) is None]
+
+    if not rest:
+        return _persona_overview(plugin, gid)
+
+    text = " ".join(rest).strip()
+    target = gid
+    if text.lower() in ("clear", "off", "none", "清空", "取消"):
+        if target is None:
+            plugin.set_default("persona", "")
+            return "✅ 已清空全局身份。各群自己设过的身份不受影响。"
+        plugin.update_group(target, persona="")
+        return f"✅ 已清空「{render.group_title(plugin, target)}」的身份。"
+
+    if target is None:
+        plugin.set_default("persona", text[:600])
+        return (f"✅ 已设为全局身份：{text[:600]}\n"
+                "（所有没单独设过的群都按这个来。群级的会覆盖它。）")
+    plugin.update_group(target, persona=text[:600])
+    say = "\n以后这个群的总结和多群时就直接说：「/sum summary " +           (str(plugin.group_cfg(target).get("name") or "") or str(target)) + "」"
+    return f"✅ 「{render.group_title(plugin, target)}」的身份：{text[:600]}{say}"
+
+
+def _persona_overview(plugin, gid=None) -> str:
+    """`/sum config persona` 的输出：多群时逐群列，别只报全局。"""
+    global_persona = plugin.defaults()["persona"]
+    lines: list[str] = []
+    if gid is None:
+        gids = sorted(plugin.group_ids())
+        lines.append("全局身份：" + (global_persona or "未设置"))
+        if gids:
+            lines.append("")
+            lines.append("各群：")
+            for one in gids[:10]:
+                local = str(plugin.group_cfg(one).get("persona") or "").strip()
+                if local:
+                    shown = local
+                elif global_persona:
+                    shown = f"{global_persona}（继承全局）"
+                else:
+                    shown = "未设置"
+                lines.append(f"  {render.group_title(plugin, one)} → {shown}")
+            if len(gids) > 10:
+                lines.append(f"  …还有 {len(gids) - 10} 个")
+    else:
+        local = str(plugin.group_cfg(gid).get("persona") or "").strip()
+        if local:
+            lines.append(f"{render.group_title(plugin, gid)} 的身份：{local}")
+        elif global_persona:
+            lines.append(f"{render.group_title(plugin, gid)} 的身份：（继承全局）{global_persona}")
+        else:
+            lines.append(f"{render.group_title(plugin, gid)} 的身份：未设置")
+
+    lines.append("")
+    lines.append("设了身份之后，总结会按那个视角筛：只留你真正要跟进的，"
+                 "无关的（别的年级、别的部门、纯通知）不往待办里塞。")
+    lines.append("")
+    lines.append("写法：`/sum config persona 26级学委`")
+    lines.append("      `/sum config persona 班级心理委员，只关心统计和上报`")
+    lines.append("      `/sum config persona clear` 清空")
+    lines.append("多群时前面加群号或群名，只对那个群生效。")
+    return "\n".join(lines)
+
+
 async def _cfg_incremental(plugin, event, gid, args):
     """增量总结开关（全局：影响所有群的手动总结与定时推送）。"""
     if not args:
@@ -721,4 +881,6 @@ _CONFIG_ACTIONS = {
     "api": _cfg_api,
     "test": _cfg_test,
     "incremental": _cfg_incremental,
+    "name": _cfg_name,
+    "persona": _cfg_persona,
 }

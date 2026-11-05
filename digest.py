@@ -137,7 +137,7 @@ def build(rows: Iterable[dict], *, clean_cfg: dict, max_chars: int) -> dict:
 
 SYSTEM_PROMPT = """你是 QQ 群消息整理助手。用户会给你一段群聊记录（可能带 [@某某] 和 [图N] /
 [文件N:名字] 标记，后面还会附上这些图片与附件的解析内容）。请输出**两部分**：
-
+{persona_block}
 一、群内容摘要（`summary` + `points`）—— 这段群聊到底发生了什么：
 1. `summary` 用 2~3 句话讲清楚整体：这群人在讨论什么、发了什么通知、有没有结论。
    写成人话，不要「大家积极讨论了…」这种空话。
@@ -166,8 +166,28 @@ SYSTEM_PROMPT = """你是 QQ 群消息整理助手。用户会给你一段群聊
 没有任何待办时 `todos` 给空数组；整段没内容时 `summary` 写一句「这段时间群里没有实质内容」。"""
 
 
+def persona_block(persona: str) -> str:
+    """把「角色」翻译成提示词里的一段。
+
+    关键在于它**影响筛选**而不只是措辞：一个学委不需要知道别的部门在招志愿者，
+    列进来只会让待办变长、把真正要交的作业挤下去。
+    """
+    text = str(persona or "").strip()
+    if not text:
+        return ""
+    return (
+        f"\n【你的身份】{text}\n\n"
+        "先想清楚这个身份在群里关心什么，再按这个视角处理：\n"
+        "1. 只把**这个身份需要跟进或知道**的事列进待办；与它无关的（别的年级、别的部门、"
+        "纯通知性质）不要列，除非明确要求全员参与；\n"
+        "2. 优先级按这个身份的紧迫感判断 —— 自己要被催、有截止日期的排前面；\n"
+        "3. 概要按这个身份的口吻写，像同班同学直接告诉你，别写成公文。\n"
+    )
+
+
 def build_chat_messages(*, group_name: str, digest: dict,
                         start_ts: int, end_ts: int, max_todos: int,
+                        persona: str = "",
                         files_section: str = "", images: list = None,
                         image_note: str = "") -> list[dict]:
     """拼成 OpenAI 兼容的 `messages`（有图片时是 multimodal 的 content 数组）。"""
@@ -186,8 +206,10 @@ def build_chat_messages(*, group_name: str, digest: dict,
     if image_note:
         user += image_note
 
-    system = {"role": "system",
-              "content": SYSTEM_PROMPT.replace("{max_todos}", str(max_todos))}
+    system = {"role": "system", "content": (
+        SYSTEM_PROMPT
+        .replace("{persona_block}", persona_block(persona))
+        .replace("{max_todos}", str(max_todos)))}
     if not images:
         return [system, {"role": "user", "content": user}]
 
@@ -201,5 +223,5 @@ def build_chat_messages(*, group_name: str, digest: dict,
 
 __all__ = [
     "is_noise", "clean_rows", "merge_rows", "format_line", "fit_budget",
-    "build", "build_chat_messages", "SYSTEM_PROMPT",
+    "build", "build_chat_messages", "persona_block", "SYSTEM_PROMPT",
 ]

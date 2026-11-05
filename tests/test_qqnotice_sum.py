@@ -366,6 +366,32 @@ def test_qa() -> None:
     check("不存在的编号忽略", qa.cite_items(picked, [99999]) == [])
 
 
+def test_persona_prompt() -> None:
+    """角色要进 prompt，而且得影响筛选（不只是措辞）。"""
+    print("\n[角色]")
+    block = digest.persona_block("26级学委")
+    check("注入身份", "26级学委" in block and "身份" in block, block[:60])
+    check("空身份不注入", digest.persona_block("") == "")
+    check("影响筛选而不只是措辞", "不要列" in block, block[:120])
+
+    flat = {"raw": 1, "kept": 1, "text": "[1] a: b", "sampled": False}
+    msgs = digest.build_chat_messages(group_name="计院", digest=flat,
+                                      start_ts=0, end_ts=0, max_todos=5,
+                                      persona="26级学委")
+    check("总结 prompt 带身份", "26级学委" in msgs[0]["content"])
+    msgs = digest.build_chat_messages(group_name="计院", digest=flat,
+                                      start_ts=0, end_ts=0, max_todos=5, persona="")
+    check("没有身份时不带", "【你的身份】" not in msgs[0]["content"])
+    check("规则还在", "只抽**有明确行动要求**" in msgs[0]["content"])
+
+    selected = {"items": [{"no": 1, "line": "[1] x", "text": "x", "ts": 0}],
+                "text": "[1] x", "total": 1, "picked": 1, "trimmed": False}
+    qmsgs = qa.build_messages(group_name="g", question="要交什么",
+                              selected=selected, start_ts=0, end_ts=0,
+                              persona="班长")
+    check("问答 prompt 带身份", "班长" in qmsgs[0]["content"])
+
+
 def test_incremental() -> None:
     """增量窗口：接上次、截断、关闭、空窗口，以及对提问不使用增量。"""
     print("\n[增量窗口]")
@@ -772,10 +798,21 @@ async def test_end_to_end() -> None:
     check("中文别名 /待办", "待办" in handlers)
     check("英文别名 /td", "td" in handlers)
 
-    # ---- 托管群
+    # ---- 托管群（接口能查到群名时自动填上）
+    class _NameApi:
+        names = {str(GROUP): "计院26级通知群", str(GROUP2): "校团委志工部"}
+
+        async def get_group_info(self, group_id):
+            return {"group_id": group_id,
+                    "group_name": self.names.get(str(group_id), "")}
+
+    plugin.api = _NameApi()
     reply = await _cmd(plugin, ["config", "add", str(GROUP)])
     check("config add 回执", "已托管" in reply, reply[:60])
     check("群号进了托管名单", plugin.is_watched(GROUP) is True)
+    check("自动拉到群名", plugin.group_cfg(GROUP).get("name") == "计院26级通知群",
+          str(plugin.group_cfg(GROUP).get("name")))
+    check("回执里显示群名", "计院26级通知群" in reply, reply[:80])
 
     # ---- 喂消息（真实入库；采集走群事件）
     texts = ["明天下午五点前把开题报告交到教务系统，@张三 负责",
@@ -917,12 +954,17 @@ async def test_end_to_end() -> None:
     # ---- 多群时要求带群号
     await _cmd(plugin, ["config", "add", str(GROUP2)])
     reply = await _cmd(plugin, ["summary", "24h"])
-    check("多群时提示带群号", "要指定群号" in reply, reply[:80])
+    check("多群时提示带群号", "要指定是哪个群" in reply, reply[:80])
     llm.chat = fake_chat
     try:
         reply = await _cmd(plugin, ["summary", str(GROUP), "24h"])
         check("带群号能跑", "提交开题报告" in reply or "没有采集到消息" in reply,
               reply[:80])
+        reply = await _cmd(plugin, ["summary", "计院", "24h"])
+        check("群名片段就能选群", "计院26级通知群" in reply, reply[:80])
+        reply = await _cmd(plugin, ["summary", "不存在的群", "24h"])
+        check("认不出的群名会列出来", "已托管" in reply and "计院26级通知群" in reply,
+              reply[:100])
     finally:
         llm.chat = original_chat
 
@@ -934,6 +976,27 @@ async def test_end_to_end() -> None:
           "21:30" in reply or "要指定群号" in reply, reply[:60])
     reply = await _cmd(plugin, ["config", "add", str(GROUP2)])
     check("重复加群有提示", "本来就在托管" in reply, reply[:60])
+
+    # ---- 群名与身份
+    reply = await _cmd(plugin, ["config", "name", "计院", "26级通知（改）"])
+    check("按群名改名", plugin.group_cfg(GROUP).get("name") == "26级通知（改）", reply[:80])
+
+    reply = await _cmd(plugin, ["config", "persona", "26级学委"])
+    check("设全局身份", plugin.defaults()["persona"] == "26级学委", reply[:80])
+    check("两个群都继承", plugin.persona_for(GROUP) == "26级学委"
+          and plugin.persona_for(GROUP2) == "26级学委")
+
+    reply = await _cmd(plugin, ["config", "persona", str(GROUP), "班长"])
+    check("群级身份覆盖全局", plugin.persona_for(GROUP) == "班长", reply[:80])
+    check("另一个群仍走全局", plugin.persona_for(GROUP2) == "26级学委")
+    reply = await _cmd(plugin, ["config", "persona"])
+    check("查看时说明继承关系", "继承全局" in reply or "班长" in reply, reply[:100])
+
+    reply = await _cmd(plugin, ["config", "persona", str(GROUP), "clear"])
+    check("清空群级身份", plugin.persona_for(GROUP) == "26级学委", reply[:60])
+
+    reply = await _cmd(plugin, ["config"])
+    check("总览里列群名", "26级通知（改）" in reply and str(GROUP) in reply, reply[-160:])
 
     reply = await _cmd(plugin, ["status"])
     check("status 有库路径", "数据库" in reply and "qqnotice_sum.db" in reply, reply[:200])
@@ -1055,6 +1118,7 @@ def main() -> int:
     test_mode()
     test_llm_config()
     test_qa()
+    test_persona_prompt()
     test_incremental()
     asyncio.run(test_media_api())
     asyncio.run(test_history_seq())

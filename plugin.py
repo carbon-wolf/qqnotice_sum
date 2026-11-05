@@ -48,7 +48,7 @@ COMMAND_NAME = "sum"
 
 class QQNoticeSumPlugin(PluginBase):
     name = "qqnotice_sum"
-    version = "1.6.0"
+    version = "1.7.0"
     description = "通知群消息 → 摘要 / 待办 / 随时提问：实时采集 + 历史补采，私聊可用，每日推送"
     author = "carbon-wolf"
 
@@ -104,6 +104,9 @@ class QQNoticeSumPlugin(PluginBase):
                 "push_time": DEFAULT_PUSH_TIME,
                 "max_todos": DEFAULT_MAX_TODOS,
                 "mode": "all",              # all / digest / todo
+                # 默认角色（如「26 级学委」）。留空 = 通用助手。
+                # 群级配置里的 persona 会覆盖它。
+                "persona": "",
                 # 增量总结：从上一次总结结束的时刻开始，只处理新消息。
                 # 关掉就每次回溯固定 window_hours。
                 "incremental": True,
@@ -197,6 +200,7 @@ class QQNoticeSumPlugin(PluginBase):
             "push_time": _clock(block.get("push_time"), DEFAULT_PUSH_TIME),
             "max_todos": _positive_int(block.get("max_todos"), DEFAULT_MAX_TODOS),
             "mode": str(block.get("mode") or "all").strip().lower(),
+            "persona": str(block.get("persona") or "").strip()[:600],
             "incremental": bool(block.get("incremental", True)),
             "max_incremental_hours": _positive_int(
                 block.get("max_incremental_hours"), DEFAULT_MAX_INCREMENTAL_HOURS),
@@ -231,6 +235,18 @@ class QQNoticeSumPlugin(PluginBase):
 
     def model_for(self, group_id) -> str:
         return str(self.group_cfg(group_id).get("model") or "").strip()
+
+    def persona_for(self, group_id) -> str:
+        """该群的角色设定：群级 > 全局默认。空串 = 通用助手。
+
+        它会进提示词，影响**筛什么**（哪些事算我这个身份要管的），
+        不只是措辞。所以群级的优先级要高于全局 —— 一个学委可能在两个群里
+        是两个不同的身份。
+        """
+        local = str(self.group_cfg(group_id).get("persona") or "").strip()
+        if local:
+            return local[:600]
+        return self.defaults()["persona"]
 
     def mode_for(self, group_id) -> str:
         """该群的默认产出模式：群配置 > 全局默认。"""
@@ -316,6 +332,7 @@ class QQNoticeSumPlugin(PluginBase):
             "push": True,
             "model": "",
             "mode": "",
+            "persona": "",
             "last_push_date": "",
         }
 

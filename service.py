@@ -87,6 +87,7 @@ async def summarize(plugin, group_id: int, *, start_ts: int, end_ts: int,
     messages = digest.build_chat_messages(
         group_name=_group_name(plugin, gid), digest=data,
         start_ts=start_ts, end_ts=end_ts, max_todos=plugin.max_todos(gid),
+        persona=plugin.persona_for(gid),
         files_section=media.build_file_section(media_out["files"]),
         images=media_out["images"],
         image_note=media.image_note(media_out["images"]))
@@ -169,7 +170,8 @@ async def ask(plugin, group_id: int, *, question: str, start_ts: int, end_ts: in
     use_model = (model or llm_cfg["model"]).strip()
     messages = qa.build_messages(group_name=_group_name(plugin, gid),
                                  question=question, selected=selected,
-                                 start_ts=start_ts, end_ts=end_ts)
+                                 start_ts=start_ts, end_ts=end_ts,
+                                 persona=plugin.persona_for(gid))
     started = time.time()
     raw = await llm.chat(plugin, messages, model=use_model)
     cost_ms = int((time.time() - started) * 1000)
